@@ -62,7 +62,7 @@ def _norm(x, y):
 
 
 class Bot:
-    name = "mech-royale-v3"
+    name = "mech-royale-v4"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -331,6 +331,147 @@ class Bot:
             out[1] += py
         return out
 
+    # --------------------------------------------------------------- combat
+    @staticmethod
+    def _aim_err(actual, desired):
+        """Angular difference between the torso's real aim and the one we want (rad)."""
+        dy = (desired[0] - actual[0] + math.pi) % (2.0 * math.pi) - math.pi
+        return math.hypot(dy, desired[1] - actual[1])
+
+    def _gun_lead(self, me_pos, target, speed):
+        """Point a straight bullet must be aimed at, given the target's velocity."""
+        x, y, z = me_pos
+        tx, ty, tz = target["pos"]
+        tv = target.get("vel") or [0.0, 0.0, 0.0]
+        mz = z + self.mech["muzzle_height"]
+        px, py, pz = tx, ty, tz
+        tof = 0.0
+        for _ in range(3):
+            d = math.sqrt((px - x) ** 2 + (py - y) ** 2 + (pz - mz) ** 2)
+            tof = max(0.0, d - 3.0) / speed   # shot starts 3 m out along the aim
+            px = tx + tv[0] * tof
+            py = ty + tv[1] * tof
+            pz = tz + tv[2] * tof
+        return [px, py, pz], tof
+
+    def _mortar_lead(self, me_pos, target, stats):
+        """Solve yaw/pitch for a lobbed shell onto a (possibly moving) target."""
+        g = stats.get("gravity", 22.0)
+        v = stats.get("speed", 72.0)
+        min_pitch = self.mech.get("min_pitch", -0.7)
+        max_pitch = self.mech.get("max_pitch", 1.3)
+        x, y, z = me_pos
+        tp = target["pos"]
+        tv = target.get("vel") or [0.0, 0.0, 0.0]
+        px, py, pz = tp
+        yaw = math.atan2(py - y, px - x)
+        pitch = 0.5
+        tof = 0.0
+        for _ in range(3):
+            lx = x + 3.0 * math.cos(yaw)          # tube: 3 m out, z + 9.5
+            ly = y + 3.0 * math.sin(yaw)
+            lz = z + 9.5
+            dx, dy = px - lx, py - ly
+            d = math.hypot(dx, dy)
+            if d < 3.0:
+                return None
+            h = pz - lz
+            a = g * d * d / (2.0 * v * v)
+            disc = d * d - 4.0 * a * (a + h)
+            if disc < 0.0:
+                return None                    # out of range
+            T = (d - math.sqrt(disc)) / (2.0 * a)   # low arc: tan(pitch)
+            pitch = math.atan(T)
+            if pitch > max_pitch or pitch < min_pitch:
+                return None
+            cp = math.cos(pitch)
+            if cp < 0.05:
+                return None
+            tof = d / (v * cp)
+            yaw = math.atan2(dy, dx)
+            px = tp[0] + tv[0] * tof
+            py = tp[1] + tv[1] * tof
+            pz = tp[2] + tv[2] * tof
+        return [yaw, pitch], tof
+
+    def combat(self, obs, target, tdist, mode):
+        """Aim / fire / reload for a visible target. Returns a dict for act.update()."""
+        me = obs["self"]
+        x, y, z = me["pos"]
+        yaw_now = me["aim"][0]
+        mz = z + self.mech["muzzle_height"]
+        muzzle = (x + 3.0 * math.cos(yaw_now), y + 3.0 * math.sin(yaw_now), mz)
+        w = me["weapons"]
+        gun = w[0]
+        gstats = gun["stats"] if gun else self.cfg["weapons"]["gun"]
+        tv = target.get("vel") or [0.0, 0.0, 0.0]
+        target_speed = math.hypot(tv[0], tv[1])
+        tp = target["pos"]
+        out: dict = {"fire": [False, False]}
+
+        lead, _ = self._gun_lead((x, y, z), target, gstats.get("speed", 252.0))
+        gun_aim = [math.atan2(lead[1] - y, lead[0] - x),
+                   math.atan2(lead[2] - mz, math.hypot(lead[0] - x, lead[1] - y))]
+        direct_aim = [math.atan2(tp[1] - y, tp[0] - x),
+                      math.atan2(tp[2] - mz, math.hypot(tp[0] - x, tp[1] - y))]
+        clear = self.world is None or self.world.los_fast(muzzle, lead)
+        in_range = math.hypot(lead[0] - x, lead[1] - y) <= gstats.get("range", 230.0)
+
+        # Retreating: keep facing the attacker (front armour) but only shoot back up close.
+        if mode == "retreat" and tdist > 60.0:
+            return {"aim": direct_aim, "fire": [False, False]}
+
+        w1 = w[1] if len(w) > 1 else None
+        kind1 = w1["kind"] if w1 else None
+        st1 = w1["stats"] if w1 else {}
+        ready1 = bool(w1) and w1.get("cooldown", 0.0) <= 0.0
+
+        aim = None
+        suppress_gun = False
+
+        # lightning: instant, 30 deg cone, fires alongside the gun
+        if kind1 == "lightning" and ready1 and clear and tdist <= st1.get("range", 45.0) \
+                and me["energy"] >= max(9.0, st1.get("energy", 3.0) * 3.0):
+            out["fire"][1] = True
+
+        # mortar: lob it at a slow target (this aim replaces the gun's)
+        if kind1 == "mortar" and ready1 and clear and mode != "retreat" \
+                and 20.0 <= tdist <= 200.0 and tdist > 15.0 and target_speed < 6.0:
+            sol = self._mortar_lead((x, y, z), target, st1)
+            if sol is not None:
+                aim = sol[0]
+                out["fire"][1] = True
+                suppress_gun = True
+
+        # laser: hold to charge, release near full (hitscan: aim where it is now)
+        if kind1 == "laser":
+            charge = w1.get("charge", 0.0)
+            want = clear and mode != "retreat" and 40.0 <= tdist <= st1.get("range", 280.0)
+            if charge > 0.0:
+                if charge >= 0.65 or not want:
+                    out["fire"][1] = False      # release the beam
+                else:
+                    out["fire"][1] = True       # keep charging
+                aim = direct_aim
+                suppress_gun = True
+            elif want and ready1:
+                out["fire"][1] = True           # start charging
+                aim = direct_aim
+                suppress_gun = True
+
+        if aim is None:
+            aim = gun_aim
+
+        # gun: fire only with a clear line of fire and the barrel roughly on target
+        if not suppress_gun:
+            tol = min(0.08, max(0.015, 1.2 * math.atan2(2.5, max(15.0, tdist))))
+            if clear and in_range and self._aim_err(me["aim"], aim) <= tol:
+                if gun and gun.get("reload", 0.0) <= 0.0 and gun.get("ammo", 0) > 0:
+                    out["fire"][0] = True
+
+        out["aim"] = aim
+        return out
+
     # ------------------------------------------------------------------ act
     def act(self, obs):
         try:
@@ -479,23 +620,26 @@ class Bot:
         act["boost"] = bool(boost)
         act["jump"] = bool(jump)
 
-        # ------------------------------------------------------------- aim
-        if threat_xy is not None:
-            if primary is not None:
-                act["aim"] = self.aim_at((x, y, z), threat_xy, primary["pos"][2])
-            else:
-                act["aim"] = [math.atan2(threat_xy[1] - y, threat_xy[0] - x), 0.0]
+        # -------------------------------------------------------- aim + fire
+        if primary is not None:
+            act.update(self.combat(obs, primary, primary_d, self.mode))
+            if not (act.get("fire", [False, False])[0] or act.get("fire", [False, False])[1]):
+                # nothing worth shooting at right now: top the gun up between fights
+                gun = me["weapons"][0]
+                if gun and gun.get("ammo", 0) < gun["stats"].get("mag", 12) \
+                        and gun.get("reload", 0.0) <= 0.0 and primary_d > 120.0:
+                    act["reload"] = True
+        elif threat_xy is not None:
+            # heard something: face it (front armour), do not waste ammo blind
+            act["aim"] = [math.atan2(threat_xy[1] - y, threat_xy[0] - x), 0.0]
+            act["fire"] = [False, False]
         else:
             act["aim"] = [math.atan2(move[1], move[0]), 0.0] if move != [0.0, 0.0] else list(me["aim"])
-
-        # ------------------------------------------------------------ fire
-        fire = False
-        if primary is not None:
-            if self.mode == "retreat":
-                fire = primary_d < 60.0        # only shoot back when they are on top of us
-            else:
-                fire = primary_d <= ENGAGE_RANGE
-        act["fire"] = [bool(fire), bool(fire)]
+            act["fire"] = [False, False]
+            gun = me["weapons"][0]
+            if gun and gun.get("ammo", 0) < gun["stats"].get("mag", 12) \
+                    and gun.get("reload", 0.0) <= 0.0:
+                act["reload"] = True
 
         if primary is not None:
             mf.draw.line([x, y, z + 7], [primary["pos"][0], primary["pos"][1], primary["pos"][2] + 4.5], "#ff5040")
