@@ -34,6 +34,21 @@ ENGAGE_RANGE = 220.0    # gun range is 230 m
 HEAR_S = 2.5            # seconds a sound still counts as a threat hint
 PHANTOM_DIST = {"near": 45.0, "mid": 110.0, "far": 250.0}
 
+LOOT_MIN_HP = 0.60      # only shop for loot at this hp fraction or better
+LOOT_MAX_DIST = 120.0   # metres: never wander this far off the safe path for loot
+
+# Upgrade order: armour and HP first, then fire rate and damage, then the rest.
+UPGRADE_PRIORITY = [
+    # tier 1: armour and HP
+    "armor", "plating", "nanites",
+    # tier 2: fire rate and damage
+    "gun_rate", "gun_damage", "laser_damage", "mortar_reload", "lightning_efficiency",
+    # tier 3: everything else that helps
+    "servos", "gyros", "sensors", "gun_velocity", "gun_mag",
+    "lightning_range", "lightning_chain", "mortar_splash", "laser_charge",
+    "capacitor", "reactor", "jets", "mortar_velocity", "laser_pierce",
+]
+
 
 def _hypot2(dx, dy):
     return math.sqrt(dx * dx + dy * dy)
@@ -47,7 +62,7 @@ def _norm(x, y):
 
 
 class Bot:
-    name = "mech-royale-v2"
+    name = "mech-royale-v3"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -147,18 +162,89 @@ class Bot:
                     best_score, best = score, [px, py]
         return best
 
+    # ------------------------------------------------------------- economy
+    def pick_upgrade(self, offer):
+        """Index of the best choice: armour/HP first, then fire rate/damage."""
+        ids = [c["id"] for c in offer["choices"]]
+        best_i, best_rank = 0, len(UPGRADE_PRIORITY) + 1
+        for i, uid in enumerate(ids):
+            rank = UPGRADE_PRIORITY.index(uid) if uid in UPGRADE_PRIORITY else len(UPGRADE_PRIORITY)
+            if rank < best_rank:
+                best_i, best_rank = i, rank
+        return best_i
+
+    def economy_target(self, obs, safe):
+        """A loot goal (supply drop / weapon / cube) when it is safe to go for it.
+
+        Returns (x, y, kind, id) or None. `safe` means no enemy in line of sight
+        near us and we are healthy: only then do we spend time on loot.
+        """
+        if not safe or self.world is None:
+            return None
+        me = obs["self"]
+        x, y = me["pos"][0], me["pos"][1]
+        zc = obs["zone"]
+        ncx, ncy = zc["next_center"]
+        nr = max(1.0, zc["next_radius"])
+
+        def usable(px, py):
+            # loot must not drag us out of the next circle or too far off path
+            return _hypot2(px - ncx, py - ncy) <= nr - 10.0 and \
+                   _hypot2(px - x, py - y) <= LOOT_MAX_DIST
+
+        best, best_d = None, 1e9
+
+        # supply drop: 3 cubes + full HP + full energy (only once it has landed
+        # and nobody else is capturing it)
+        for d in obs.get("drops", ()):
+            if d["lands_in"] > 0.0:
+                continue
+            if d.get("holder") is not None and d["holder"] != me["id"]:
+                continue
+            if not usable(d["pos"][0], d["pos"][1]):
+                continue
+            dd = _hypot2(d["pos"][0] - x, d["pos"][1] - y)
+            if dd < best_d:
+                best, best_d = [d["pos"][0], d["pos"][1], "drop", d["id"]], dd
+
+        # weapon: fill an empty slot, or upgrade a gun for something better
+        held = {w["kind"] for w in me["weapons"] if w}
+        want_swap = me["weapons"][1] is None
+        if want_swap:
+            for p in obs.get("pickups", ()):
+                if p["kind"] == "gun" or p["kind"] in held:
+                    continue
+                if not usable(p["pos"][0], p["pos"][1]):
+                    continue
+                dd = _hypot2(p["pos"][0] - x, p["pos"][1] - y)
+                if dd < best_d:
+                    best, best_d = [p["pos"][0], p["pos"][1], "pickup", p["id"]], dd
+
+        # power cubes: free HP and damage, pick them up by walking over them
+        for c in obs.get("cubes", ()):
+            if not usable(c["pos"][0], c["pos"][1]):
+                continue
+            dd = _hypot2(c["pos"][0] - x, c["pos"][1] - y)
+            if dd < best_d:
+                best, best_d = [c["pos"][0], c["pos"][1], "cube", c["id"]], dd
+        return best
+
     # ------------------------------------------------------------- movement
     def navigate(self, obs, goal):
         """Move direction toward `goal` using a cached A* path (replanned lazily)."""
         me = obs["self"]
         x, y = me["pos"][0], me["pos"][1]
         t = obs["t"]
+        at_goal = _hypot2(goal[0] - x, goal[1] - y) < 2.5
 
         if self.last_pos is None:
             self.last_pos = (x, y)
             self.stuck_since = t
         elif _hypot2(x - self.last_pos[0], y - self.last_pos[1]) > 1.0:
             self.last_pos = (x, y)
+            self.stuck_since = t
+        elif at_goal:
+            self.last_pos = (x, y)      # arrived on purpose: not stuck, do not hop
             self.stuck_since = t
         elif t - (self.stuck_since or t) > STUCK_S:
             self.stuck_since = t
@@ -265,7 +351,7 @@ class Bot:
         hp_frac = me["hp"] / max(1.0, me["max_hp"])
         act = {"tick": obs["tick"]}
         if obs.get("offer"):
-            act["pick"] = 0
+            act["pick"] = self.pick_upgrade(obs["offer"])
 
         vis, phantoms = self.threats(obs)
         primary = vis[0][1] if vis else None
@@ -330,6 +416,21 @@ class Bot:
                 move, dist_goal = self.navigate(obs, zone_goal)
         elif zone_goal is not None and not vis:
             move, dist_goal = self.navigate(obs, zone_goal)
+        elif not vis:
+            # safe and inside the next circle: spend the time on loot
+            eco = self.economy_target(obs, hp_frac >= LOOT_MIN_HP and n_close == 0)
+            if eco is not None:
+                move, dist_goal = self.navigate(obs, eco[:2])
+                if eco[2] == "pickup" and _hypot2(eco[0] - x, eco[1] - y) <= 4.0 \
+                        and me["weapons"][1] is None:
+                    act["take"] = eco[3]      # weapon pickup: fill the empty slot
+            else:
+                jx, jy = self.dodge(obs)
+                if jx or jy:
+                    move = list(_norm(jx, jy))
+                else:
+                    move, dist_goal = [0.0, 0.0], 0.0
+                    self.path = None
         elif vis:
             # engage: hold ~100 m, strafe perpendicular, dodge what is flying at us
             tx, ty = threat_xy if threat_xy else (x + 1.0, y)
