@@ -37,6 +37,8 @@ PHANTOM_DIST = {"near": 45.0, "mid": 110.0, "far": 250.0}
 LOOT_MIN_HP = 0.60      # only shop for loot at this hp fraction or better
 LOOT_MAX_DIST = 120.0   # metres: never wander this far off the safe path for loot
 
+AIM_HEIGHT = 4.5        # metres up the target's model that we aim at (torso centre)
+
 # Upgrade order: armour and HP first, then fire rate and damage, then the rest.
 UPGRADE_PRIORITY = [
     # tier 1: armour and HP
@@ -62,7 +64,7 @@ def _norm(x, y):
 
 
 class Bot:
-    name = "mech-royale-v4"
+    name = "mech-royale-v5"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -339,9 +341,15 @@ class Bot:
         return math.hypot(dy, desired[1] - actual[1])
 
     def _gun_lead(self, me_pos, target, speed):
-        """Point a straight bullet must be aimed at, given the target's velocity."""
+        """Point a straight bullet must be aimed at, given the target's velocity.
+
+        Aims at torso height, not at `pos`: `pos[2]` is the target's FEET
+        (it sits on the ground), and a ray that ends at ground level is
+        reported blocked by the terrain test at its endpoint.
+        """
         x, y, z = me_pos
         tx, ty, tz = target["pos"]
+        tz += AIM_HEIGHT                 # torso centre, not the feet
         tv = target.get("vel") or [0.0, 0.0, 0.0]
         mz = z + self.mech["muzzle_height"]
         px, py, pz = tx, ty, tz
@@ -398,9 +406,7 @@ class Bot:
         """Aim / fire / reload for a visible target. Returns a dict for act.update()."""
         me = obs["self"]
         x, y, z = me["pos"]
-        yaw_now = me["aim"][0]
         mz = z + self.mech["muzzle_height"]
-        muzzle = (x + 3.0 * math.cos(yaw_now), y + 3.0 * math.sin(yaw_now), mz)
         w = me["weapons"]
         gun = w[0]
         gstats = gun["stats"] if gun else self.cfg["weapons"]["gun"]
@@ -413,8 +419,15 @@ class Bot:
         gun_aim = [math.atan2(lead[1] - y, lead[0] - x),
                    math.atan2(lead[2] - mz, math.hypot(lead[0] - x, lead[1] - y))]
         direct_aim = [math.atan2(tp[1] - y, tp[0] - x),
-                      math.atan2(tp[2] - mz, math.hypot(tp[0] - x, tp[1] - y))]
-        clear = self.world is None or self.world.los_fast(muzzle, lead)
+                      math.atan2(tp[2] + AIM_HEIGHT - mz,
+                                 math.hypot(tp[0] - x, tp[1] - y))]
+        # Line of fire is ALREADY decided by the server: a mech only appears in
+        # `obs["mechs"]` when it is in range, inside the 120 deg FOV wedge and
+        # nothing solid is between us (protocol, "Vision"). We used to re-check
+        # it here, but aimed the ray at `pos` - the target's FEET - so the ray
+        # ran into the ground at its own endpoint and came back "blocked" for
+        # 98.8 % of real engagements, which stopped us firing almost completely.
+        clear = True
         in_range = math.hypot(lead[0] - x, lead[1] - y) <= gstats.get("range", 230.0)
 
         # Retreating: keep facing the attacker (front armour) but only shoot back up close.
