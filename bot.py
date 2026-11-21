@@ -1,11 +1,15 @@
 """Mech Royale bot (MIT). Reads observations on stdin, writes actions on stdout.
 
-v1 SURVIVAL BASICS:
-  - loads /arena at startup: 4 m walkable grid + line-of-sight (world.py)
-  - always knows the current and next circle, moves into the next circle early
-  - A* around buildings, with stuck recovery (jump, then jet)
-The wrapper (mechfight.py) already answers `ready`, echoes `tick`, skips stale
-observations, and coasts on exceptions; this file adds a second safety net.
+v1 SURVIVAL BASICS (kept):
+  - /arena loaded at startup: 4 m walkable grid + line-of-sight (world.py)
+  - current/next circle known, early move into the next circle, never die to zone
+  - A* around buildings with stuck recovery (jump, then jet)
+
+v2 DEFENCE (this version):
+  - face the attacker: aim tracks the nearest threat (rear armour takes x1.5)
+  - strafe/sidestep: perpendicular dodge away from incoming bullets and shells
+  - hurt or outnumbered -> break line of sight behind a building, stop firing,
+    regenerate; re-engage when healthy (never forever: if hunted closely, fight)
 """
 from __future__ import annotations
 
@@ -15,28 +19,44 @@ import random
 import mechfight as mf
 from world import World
 
-SAFE_MARGIN = 30.0     # metres inside the next circle we want to be
-STUCK_S = 1.0          # seconds of no progress before we react
+SAFE_MARGIN = 30.0      # metres inside the next circle we want to be
+STUCK_S = 1.0           # seconds of no progress before we react
 WAYPOINT_REACHED = 5.0  # metres
+
+RETREAT_HP = 0.40       # hp fraction that triggers a retreat
+RETREAT_HP_MANY = 0.70  # ...when 2+ enemies have line of sight to us
+RENGAGE_HP = 0.70       # hp fraction we want back before re-engaging
+RETREAT_MIN_S = 9.0     # stay in cover at least this long (regen needs 5 s + delay)
+RETREAT_MAX_S = 16.0    # ...but never hide longer than this
+THREAT_CLOSE = 50.0     # metres: an enemy this close ends the retreat, fight
+ENGAGE_RANGE = 220.0    # gun range is 230 m
+
+HEAR_S = 2.5            # seconds a sound still counts as a threat hint
+PHANTOM_DIST = {"near": 45.0, "mid": 110.0, "far": 250.0}
 
 
 def _hypot2(dx, dy):
     return math.sqrt(dx * dx + dy * dy)
 
 
+def _norm(x, y):
+    d = _hypot2(x, y)
+    if d < 1e-9:
+        return 0.0, 0.0
+    return x / d, y / d
+
+
 class Bot:
-    name = "mech-royale-v1"
+    name = "mech-royale-v2"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
         self.mech = self.cfg["mech"]
-        self.walk_speed = self.mech["walk_speed"]
-        self.boost_speed = self.mech["boost_speed"]
         self.rng = random.Random(hello.get("seed", 0))
         self.world = None
         try:
             self.world = World(hello["map"]["dir"])
-        except Exception as e:  # never die because the map failed to load
+        except Exception as e:
             mf.log("map load failed, steering direct:", repr(e))
         # navigation state
         self.path = None
@@ -44,7 +64,15 @@ class Bot:
         self.wp_i = 0
         self.stuck_since = None
         self.last_pos = None
-        self.jump_hold = 0  # ticks of forced jump/jet left
+        self.jump_hold = 0
+        # defence state
+        self.mode = "roam"          # roam | retreat
+        self.cover = None
+        self.cover_t = -1e9
+        self.cover_threat = None
+        self.retreat_t = -1e9
+        self.strafe_sign = 1.0
+        self.strafe_flip_t = -1e9
 
     # ------------------------------------------------------------------ zone
     def zone_goal(self, obs):
@@ -56,19 +84,76 @@ class Bot:
         nr = z["next_radius"]
         d = _hypot2(x - ncx, y - ncy)
         if not me["in_zone"]:
-            return [ncx, ncy]            # outside now: straight in, boosting
+            return [ncx, ncy]
         if d > max(0.0, nr - SAFE_MARGIN):
-            return [ncx, ncy]            # not comfortably inside the next circle yet
-        return None                      # safe: hold (combat/later versions use this time)
+            return [ncx, ncy]
+        return None
 
-    # ------------------------------------------------------------- navigation
+    # ------------------------------------------------------------- threats
+    def threats(self, obs):
+        """(visible enemies, phantom points from sounds/damage) in world coordinates."""
+        me = obs["self"]
+        x, y, z = me["pos"]
+        vis = []
+        for m in obs["mechs"]:
+            if m["kind"] != "mech":
+                continue
+            d = _hypot2(m["pos"][0] - x, m["pos"][1] - y)
+            vis.append((d, m))
+        vis.sort(key=lambda t: t[0])
+
+        phantoms = []
+        for s in obs.get("sounds", ()):          # heard a shot: something is out there
+            if s["kind"] in ("gun", "mortar", "explosion", "laser", "lightning", "death") and s["age"] <= HEAR_S:
+                d = PHANTOM_DIST.get(s["dist"], 150.0)
+                phantoms.append((s["bearing"], d, s["age"]))
+        for e in obs.get("events", ()):          # got hit: aim back at the shooter
+            if e["type"] == "damaged" and e.get("bearing") is not None:
+                phantoms.append((e["bearing"], 90.0, 0.0))
+        return vis, phantoms
+
+    @staticmethod
+    def phantom_point(me_pos, bearing, dist):
+        return [me_pos[0] + math.cos(bearing) * dist, me_pos[1] + math.sin(bearing) * dist]
+
+    # --------------------------------------------------------- cover seeking
+    def pick_cover(self, obs, threat_xy):
+        """A walkable point the threat cannot see, biased toward the next circle."""
+        if self.world is None:
+            return None
+        me = obs["self"]
+        x, y, z = me["pos"]
+        tx, ty = threat_xy
+        eye = z + self.mech["eye_height"]
+        t_eye = (tx, ty, self.world.ground(tx, ty) + self.mech["eye_height"])
+        away = math.atan2(y - ty, x - tx)
+        zc = obs["zone"]
+        ncx, ncy = zc["next_center"]
+        nr = max(1.0, zc["next_radius"])
+        best, best_score = None, -1e9
+        for r in (35.0, 50.0, 70.0, 95.0):
+            for k in range(12):
+                ang = away + math.radians(-100 + k * (200 / 11.0))
+                px = x + math.cos(ang) * r
+                py = y + math.sin(ang) * r
+                if not self.world.is_walkable(px, py):
+                    continue
+                pz = self.world.ground(px, py)
+                if self.world.los_fast((px, py, pz + eye), t_eye):
+                    continue  # still visible from there: no cover
+                dz = _hypot2(px - ncx, py - ncy)
+                score = -r * 0.4 + max(0.0, (nr - dz)) * 1.5
+                if score > best_score:
+                    best_score, best = score, [px, py]
+        return best
+
+    # ------------------------------------------------------------- movement
     def navigate(self, obs, goal):
         """Move direction toward `goal` using a cached A* path (replanned lazily)."""
         me = obs["self"]
         x, y = me["pos"][0], me["pos"][1]
         t = obs["t"]
 
-        # stuck bookkeeping: no progress while we want to move
         if self.last_pos is None:
             self.last_pos = (x, y)
             self.stuck_since = t
@@ -78,8 +163,8 @@ class Bot:
         elif t - (self.stuck_since or t) > STUCK_S:
             self.stuck_since = t
             self.last_pos = (x, y)
-            self.jump_hold = 12          # jump + jet for 1.2 s
-            self.path = None             # force a fresh plan (with jitter below)
+            self.jump_hold = 12
+            self.path = None
 
         need_plan = (
             self.path is None
@@ -89,7 +174,7 @@ class Bot:
         )
         if need_plan and self.world is not None:
             gx, gy = goal
-            if self.jump_hold > 0:       # while unsticking, aim slightly off to slide around
+            if self.jump_hold > 0:
                 gx += self.rng.uniform(-8, 8)
                 gy += self.rng.uniform(-8, 8)
             try:
@@ -100,7 +185,6 @@ class Bot:
                 mf.log("astar failed:", repr(e))
                 self.path = None
 
-        # pick the waypoint to walk to
         tx, ty = goal
         if self.path:
             while self.wp_i < len(self.path) - 1:
@@ -109,7 +193,6 @@ class Bot:
                     self.wp_i += 1
                 else:
                     break
-            # look-ahead: skip ahead while the line is clear
             best = self.wp_i
             for j in range(self.wp_i, min(len(self.path), self.wp_i + 4)):
                 if self.world is None or self.world.walkable_line((x, y), self.path[j]):
@@ -121,19 +204,56 @@ class Bot:
         dx, dy = tx - x, ty - y
         d = _hypot2(dx, dy)
         if d < 0.5:
-            return [0.0, 0.0], False
+            return [0.0, 0.0], 0.0
         return [dx / d, dy / d], d
+
+    # ------------------------------------------------------------------ aim
+    def aim_at(self, me_pos, target_xy, target_z):
+        dx = target_xy[0] - me_pos[0]
+        dy = target_xy[1] - me_pos[1]
+        return [
+            math.atan2(dy, dx),
+            math.atan2(target_z - me_pos[2] - 2.5, _hypot2(dx, dy)),
+        ]
+
+    # ---------------------------------------------------------- dodge vector
+    def dodge(self, obs):
+        """Sidestep bullets and shells on a collision course with us."""
+        me = obs["self"]
+        x, y = me["pos"][0], me["pos"][1]
+        vx, vy = me["vel"][0], me["vel"][1]
+        out = [0.0, 0.0]
+        for p in obs.get("projectiles", ()):
+            rx, ry = x - p["pos"][0], y - p["pos"][1]
+            pvx, pvy = p["vel"][0], p["vel"][1]
+            vv = pvx * pvx + pvy * pvy
+            if vv < 1.0:
+                continue
+            tca = (rx * pvx + ry * pvy) / vv
+            if tca <= 0.0 or tca > 1.6:
+                continue
+            miss = _hypot2(rx - pvx * tca, ry - pvy * tca)
+            limit = 13.0 if p["kind"] == "mortar" else 8.0
+            if miss > limit:
+                continue
+            # perpendicular to the shell, on the side we are already drifting to
+            side = 1.0 if (rx * -pvy + ry * pvx) >= 0 else -1.0
+            px, py = -pvy * side, pvx * side
+            if vx * px + vy * py < 0:      # don't fight our own momentum
+                px, py = -px, -py
+            out[0] += px
+            out[1] += py
+        return out
 
     # ------------------------------------------------------------------ act
     def act(self, obs):
         try:
             return self._act(obs)
-        except Exception as e:  # second safety net: the wrapper coasts if we raise
+        except Exception as e:
             mf.log("act failed:", repr(e))
             z = obs.get("zone", {})
             nc = z.get("next_center", [0.0, 0.0])
-            me = obs.get("self", {})
-            p = me.get("pos", [0.0, 0.0, 0.0])
+            p = obs.get("self", {}).get("pos", [0.0, 0.0, 0.0])
             dx, dy = nc[0] - p[0], nc[1] - p[1]
             d = _hypot2(dx, dy) or 1.0
             return {"tick": obs["tick"], "move": [dx / d, dy / d], "boost": True}
@@ -141,44 +261,146 @@ class Bot:
     def _act(self, obs):
         me = obs["self"]
         x, y, z = me["pos"]
+        t = obs["t"]
+        hp_frac = me["hp"] / max(1.0, me["max_hp"])
         act = {"tick": obs["tick"]}
         if obs.get("offer"):
             act["pick"] = 0
 
-        # ---- move: zone safety first
-        goal = self.zone_goal(obs)
-        if goal is None:
-            move, dist_goal = [0.0, 0.0], 0.0
-            self.path = None
+        vis, phantoms = self.threats(obs)
+        primary = vis[0][1] if vis else None
+        primary_d = vis[0][0] if vis else None
+        n_close = 0
+        for d, m in vis:
+            if d >= 140.0:
+                continue
+            if self.world is None or self.world.los_fast(
+                    (x, y, z + 8), (m["pos"][0], m["pos"][1], m["pos"][2] + 4.5)):
+                n_close += 1
+
+        # threat point (for facing / cover), from vision first, else sounds/damage
+        threat_xy = None
+        if primary is not None:
+            threat_xy = [primary["pos"][0], primary["pos"][1]]
+        elif phantoms:
+            phantoms.sort(key=lambda p: p[2])
+            threat_xy = self.phantom_point((x, y), phantoms[0][0], phantoms[0][1])
+
+        # ---------------------------------------------------- mode switching
+        hunted = n_close >= 1 and primary_d is not None and primary_d < THREAT_CLOSE
+        if self.mode != "retreat":
+            if hp_frac < RETREAT_HP or (n_close >= 2 and hp_frac < RETREAT_HP_MANY):
+                if threat_xy is not None:
+                    self.mode = "retreat"
+                    self.retreat_t = t
+                    self.cover = None
+                    self.path = None
         else:
+            too_long = t - self.retreat_t > RETREAT_MAX_S
+            min_done = t - self.retreat_t >= RETREAT_MIN_S
+            if hunted or too_long or (min_done and hp_frac >= RENGAGE_HP) or hp_frac >= 0.95:
+                self.mode = "roam"
+                self.cover = None
+                self.path = None
+
+        # --------------------------------------------------------- movement
+        zone_goal = self.zone_goal(obs)
+        move = [0.0, 0.0]
+        dist_goal = 0.0
+        if not me["in_zone"]:
+            # never trade zone damage for anything: zone wins
+            move, dist_goal = self.navigate(obs, zone_goal or [obs["zone"]["next_center"][0],
+                                                               obs["zone"]["next_center"][1]])
+            if self.mode == "retreat":
+                self.mode = "roam"
+                self.cover = None
+        elif self.mode == "retreat":
+            if threat_xy is None:
+                threat_xy = [obs["zone"]["next_center"][0], obs["zone"]["next_center"][1]]
+            if self.cover is None or t - self.cover_t > 1.5 or (
+                    self.cover_threat and _hypot2(self.cover_threat[0] - threat_xy[0],
+                                                  self.cover_threat[1] - threat_xy[1]) > 25.0):
+                self.cover = self.pick_cover(obs, threat_xy)
+                self.cover_t = t
+                self.cover_threat = list(threat_xy) if threat_xy else None
+                self.path = None
+            goal = self.cover or [x - (threat_xy[0] - x), y - (threat_xy[1] - y)]
             move, dist_goal = self.navigate(obs, goal)
-        boost = (not me["in_zone"]) or (goal is not None and dist_goal > 60.0 and me["energy"] > 30)
+            if zone_goal is not None and self.cover is None:
+                move, dist_goal = self.navigate(obs, zone_goal)
+        elif zone_goal is not None and not vis:
+            move, dist_goal = self.navigate(obs, zone_goal)
+        elif vis:
+            # engage: hold ~100 m, strafe perpendicular, dodge what is flying at us
+            tx, ty = threat_xy if threat_xy else (x + 1.0, y)
+            dx, dy = _norm(tx - x, ty - y)
+            if t - self.strafe_flip_t > 1.3:
+                self.strafe_flip_t = t
+                self.strafe_sign = -self.strafe_sign
+                if self.world is not None and self.world.is_walkable(
+                        x - dy * 12 * self.strafe_sign, y + dx * 12 * self.strafe_sign) is False:
+                    self.strafe_sign = -self.strafe_sign
+            range_push = 0.0
+            if primary_d is not None:
+                if primary_d > 130.0:
+                    range_push = 0.7
+                elif primary_d < 60.0:
+                    range_push = -0.7
+            mx = dx * range_push - dy * self.strafe_sign
+            my = dy * range_push + dx * self.strafe_sign
+            jx, jy = self.dodge(obs)
+            mx += jx * 1.4
+            my += jy * 1.4
+            if zone_goal is not None:           # don't strafe out of safety
+                zx, zy = _norm(zone_goal[0] - x, zone_goal[1] - y)
+                mx = mx * 0.45 + zx * 1.0
+                my = my * 0.45 + zy * 1.0
+            move = [mx, my]
+            d = _hypot2(mx, my)
+            if d > 1e-6:
+                move = [mx / d, my / d]
+            dist_goal = 0.0
+        else:
+            # nothing visible: still sidestep anything aimed at us
+            jx, jy = self.dodge(obs)
+            if jx or jy:
+                move = [_norm(jx, jy)[0], _norm(jx, jy)[1]]
+            elif zone_goal is not None:
+                move, dist_goal = self.navigate(obs, zone_goal)
+
+        boost = (not me["in_zone"]) or (dist_goal > 60.0 and me["energy"] > 30)
         jump = False
         if self.jump_hold > 0:
             self.jump_hold -= 1
             jump = me["grounded"]
-            boost = True                # jet while airborne to clear the obstacle
+            boost = True
         act["move"] = move
         act["boost"] = bool(boost)
         act["jump"] = bool(jump)
 
-        # ---- shoot: the starter behaviour, kept unchanged in v1
-        enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
-        enemies.sort(key=lambda m: _hypot2(m["pos"][0] - x, m["pos"][1] - y))
-        yaw = math.atan2(move[1], move[0]) if move != [0.0, 0.0] else me["aim"][0]
-        act["aim"] = [yaw, 0.0]
-        if enemies:
-            t = enemies[0]["pos"]
-            act["aim"] = [
-                math.atan2(t[1] - y, t[0] - x),
-                math.atan2(t[2] - z - 2.5, _hypot2(t[0] - x, t[1] - y)),
-            ]
-            act["fire"] = [True, True]
-            mf.draw.line([x, y, z + 7], [t[0], t[1], t[2] + 4.5], "#ff5040")
+        # ------------------------------------------------------------- aim
+        if threat_xy is not None:
+            if primary is not None:
+                act["aim"] = self.aim_at((x, y, z), threat_xy, primary["pos"][2])
+            else:
+                act["aim"] = [math.atan2(threat_xy[1] - y, threat_xy[0] - x), 0.0]
+        else:
+            act["aim"] = [math.atan2(move[1], move[0]), 0.0] if move != [0.0, 0.0] else list(me["aim"])
 
-        mf.draw.label(f"hp {me['hp']:.0f} {'IN ZONE' if me['in_zone'] else 'ZONE!'}")
-        if goal:
-            mf.draw.point([goal[0], goal[1], z], "#40c0ff", 6)
+        # ------------------------------------------------------------ fire
+        fire = False
+        if primary is not None:
+            if self.mode == "retreat":
+                fire = primary_d < 60.0        # only shoot back when they are on top of us
+            else:
+                fire = primary_d <= ENGAGE_RANGE
+        act["fire"] = [bool(fire), bool(fire)]
+
+        if primary is not None:
+            mf.draw.line([x, y, z + 7], [primary["pos"][0], primary["pos"][1], primary["pos"][2] + 4.5], "#ff5040")
+        if self.mode == "retreat" and self.cover:
+            mf.draw.point([self.cover[0], self.cover[1], z], "#40ff70", 6)
+        mf.draw.label(f"hp {me['hp']:.0f} {self.mode} n={len(vis)}")
         return act
 
 

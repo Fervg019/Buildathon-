@@ -5,7 +5,8 @@ over 48 matches) reported back after submitting that exact commit.
 
 | Commit (full hash) | Version / change | Official score |
 | --- | --- | --- |
-| (v0) | Unchanged kit example bot, baseline. | — |
+| `0d0aed0c7c981c330fc7767ee695e59a6d373970` | v0: unchanged kit example bot + repo layout (Dockerfile, wrapper, map module, NOTES, MIT). | — |
+| `ccd25fce67fae0cfb6ff07df6d18b5488ea7d454` | v1 survival basics: `world.py` (4 m walkable grid, LOS, time-sliced A*), zone-aware goal (early move into next circle), stuck recovery (jump + jet). | (pending) |
 
 ## Rules we follow
 

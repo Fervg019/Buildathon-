@@ -181,6 +181,64 @@ class World:
                     continue
                 walk[row + c] = 1
         self.walk = walk
+        self._build_wall_heights()
+
+    def _build_wall_heights(self) -> None:
+        """Per cell: lowest base and highest top of any prism covering it.
+
+        Feeds los_fast(): a sight line at height z is blocked where
+        wall_base <= z <= wall_top. Cheap array lookups instead of polygon tests.
+        """
+        n = self.cols * self.rows
+        self.wall_base = array.array("f", [1e9]) * n
+        self.wall_top = array.array("f", [-1e9]) * n
+        cell = self.cell
+        for base, top, pts, bb in self.prisms:
+            c0 = max(0, int((bb[0] - self.ox) / cell))
+            c1 = min(self.cols - 1, int((bb[2] - self.ox) / cell))
+            r0 = max(0, int((bb[1] - self.oy) / cell))
+            r1 = min(self.rows - 1, int((bb[3] - self.oy) / cell))
+            for r in range(r0, r1 + 1):
+                cy = self.oy + (r + 0.5) * cell
+                row = r * self.cols
+                for c in range(c0, c1 + 1):
+                    cx = self.ox + (c + 0.5) * cell
+                    if _pip(cx, cy, pts):
+                        i = row + c
+                        if base < self.wall_base[i]:
+                            self.wall_base[i] = base
+                        if top > self.wall_top[i]:
+                            self.wall_top[i] = top
+
+    def los_fast(self, a, b) -> bool:
+        """Cheap line of sight using the wall-height grid (terrain + buildings).
+
+        Same answer as los() for building-scale blockers, ~100x faster; use it for
+        per-decision combat/cover checks. Trees are ignored (they never stop shots).
+        """
+        ax, ay, az = a
+        bx, by, bz = b
+        dx, dy, dz = bx - ax, by - ay, bz - az
+        dist = math.hypot(dx, dy)
+        n = int(dist / 3.0) + 1
+        sx, sy, sz = dx / n, dy / n, dz / n
+        px, py, pz = ax, ay, az
+        cols, rows, wb, wt = self.cols, self.rows, self.wall_base, self.wall_top
+        inv = 1.0 / self.cell
+        for _ in range(n):
+            px += sx
+            py += sy
+            pz += sz
+            if pz <= self.ground(px, py) + 0.2:
+                return False
+            c = int((px - self.ox) * inv)
+            r = int((py - self.oy) * inv)
+            if c < 0 or r < 0 or c >= cols or r >= rows:
+                continue
+            i = r * cols + c
+            if wb[i] <= pz <= wt[i]:
+                return False
+        return True
 
     def cell_of(self, x: float, y: float):
         c = int((x - self.ox) / self.cell)
