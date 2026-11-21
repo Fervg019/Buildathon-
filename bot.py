@@ -5,11 +5,20 @@ v1 SURVIVAL BASICS (kept):
   - current/next circle known, early move into the next circle, never die to zone
   - A* around buildings with stuck recovery (jump, then jet)
 
-v2 DEFENCE (this version):
+v2 DEFENCE (kept, minus the part that cost us the game):
   - face the attacker: aim tracks the nearest threat (rear armour takes x1.5)
   - strafe/sidestep: perpendicular dodge away from incoming bullets and shells
-  - hurt or outnumbered -> break line of sight behind a building, stop firing,
-    regenerate; re-engage when healthy (never forever: if hunted closely, fight)
+  - hurt or outnumbered -> break line of sight behind a building and regenerate;
+    re-engage when healthy (never forever: if hunted closely, fight)
+
+v6 RETREAT NO LONGER STOPS US SHOOTING:
+  - v4/v5 returned fire:[false,false] whenever mode=="retreat" and the target
+    was beyond 60 m. Measured on the recorded stream: 165/300 ticks (55%)
+    were spent in retreat and it fired on 1 of the 96 retreat ticks that had
+    a target, while HP sat at p50 0.39 - a death spiral (hurt -> retreat ->
+    don't shoot -> never recover -> still the weakest -> squad focuses us).
+  - Retreat now changes WHERE we move (toward cover, away from the threat),
+    not WHETHER we shoot. The gun costs no energy, so firing is free.
 """
 from __future__ import annotations
 
@@ -64,7 +73,7 @@ def _norm(x, y):
 
 
 class Bot:
-    name = "mech-royale-v5"
+    name = "mech-royale-v6"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -429,10 +438,6 @@ class Bot:
         # 98.8 % of real engagements, which stopped us firing almost completely.
         clear = True
         in_range = math.hypot(lead[0] - x, lead[1] - y) <= gstats.get("range", 230.0)
-
-        # Retreating: keep facing the attacker (front armour) but only shoot back up close.
-        if mode == "retreat" and tdist > 60.0:
-            return {"aim": direct_aim, "fire": [False, False]}
 
         w1 = w[1] if len(w) > 1 else None
         kind1 = w1["kind"] if w1 else None
