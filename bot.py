@@ -17,8 +17,15 @@ v6 RETREAT NO LONGER STOPS US SHOOTING:
     were spent in retreat and it fired on 1 of the 96 retreat ticks that had
     a target, while HP sat at p50 0.39 - a death spiral (hurt -> retreat ->
     don't shoot -> never recover -> still the weakest -> squad focuses us).
-  - Retreat now changes WHERE we move (toward cover, away from the threat),
-    not WHETHER we shoot. The gun costs no energy, so firing is free.
+v7 DODGE THE CHARGING LASER (76 % of all damage we take):
+  - An enemy charging a laser broadcasts `charging: true` + their aim, and the
+    beam is ~1 deg wide, so protocol.md makes the line dodgable. Measured on a
+    real match: charging on 33 ticks, we were dead centre in the beam on 29
+    (0.0-0.3 deg off) and stepped aside on none of them. Laser was 1260 of the
+    1665 damage we took; gun was only 405.
+  - Sidestep perpendicular to the beam, on the side we are already on, and
+    boost while doing it. Retreat still changes where we run, not whether we
+    shoot.
 """
 from __future__ import annotations
 
@@ -73,7 +80,7 @@ def _norm(x, y):
 
 
 class Bot:
-    name = "mech-royale-v6"
+    name = "mech-royale-v7"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -490,6 +497,38 @@ class Bot:
         out["aim"] = aim
         return out
 
+    # ---------------------------------------------------------- laser dodge
+    def laser_dodge(self, obs):
+        """Sidestep out of a charging laser's line, which the protocol makes dodgable.
+
+        A charged laser does up to 315 damage and is 76 % of everything we take
+        (1260 of 1665 over a real 37 s window). While charging the shooter
+        broadcasts `charging: true` plus their aim, and the beam is only about
+        1 deg wide (mech radius 2.5 m) - protocol.md says the line is meant to
+        be dodged. Measured: an enemy was charging on 33 ticks and we sat dead
+        centre in the beam on 29 of them, 0.0-0.3 deg off, and stepped aside on
+        none of them.
+
+        Returns an unnormalised [dx, dy] pushing us off the line, on whichever
+        side of it we are already standing.
+        """
+        me = obs["self"]
+        x, y = me["pos"][0], me["pos"][1]
+        out = [0.0, 0.0]
+        for m in obs["mechs"]:
+            if m["kind"] != "mech" or not m.get("charging"):
+                continue
+            dx, dy = x - m["pos"][0], y - m["pos"][1]
+            d = _hypot2(dx, dy)
+            if d < 5.0 or d > 260.0:
+                continue                      # too close to aim at, or out of range
+            yaw = m["aim"][0]                 # the beam travels along their aim
+            bx, by = math.cos(yaw), math.sin(yaw)
+            side = 1.0 if (bx * dy - by * dx) >= 0.0 else -1.0
+            out[0] += -by * side              # perpendicular to the beam
+            out[1] += bx * side
+        return out
+
     # ------------------------------------------------------------------ act
     def act(self, obs):
         try:
@@ -628,7 +667,20 @@ class Bot:
             elif zone_goal is not None:
                 move, dist_goal = self.navigate(obs, zone_goal)
 
-        boost = (not me["in_zone"]) or (dist_goal > 60.0 and me["energy"] > 30)
+        # ---- v7: get out of a charging laser's line (76 % of our damage) ----
+        dodging_laser = False
+        if me["in_zone"]:
+            ld = self.laser_dodge(obs)
+            if ld[0] or ld[1]:
+                mx = move[0] * 0.25 + ld[0] * 1.6
+                my = move[1] * 0.25 + ld[1] * 1.6
+                d = _hypot2(mx, my)
+                if d > 1e-6:
+                    move = [mx / d, my / d]
+                    dodging_laser = True       # worth the energy to clear it fast
+
+        boost = (not me["in_zone"]) or (dist_goal > 60.0 and me["energy"] > 30) \
+            or (dodging_laser and me["energy"] > 25.0)
         jump = False
         if self.jump_hold > 0:
             self.jump_hold -= 1
