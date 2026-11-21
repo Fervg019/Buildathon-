@@ -18,6 +18,21 @@ over 48 matches) reported back after submitting that exact commit.
 - Local `check/check.py` = protocol/timing only, never a skill score.
 - Official practice score is the truth. Do not tune to practice seeds (finals use new seeds).
 
+## Confirmed from the submission page (scorer `builders-3`)
+
+- **6 submissions per hour** (the brief said 4). A rejected entry still uses a slot, but
+  failed builds/checks **never affect your best score** — rejections are free information.
+- A bot that crashes or stops answering is **scored, not rejected**: it stays in the match
+  standing still as a target. Crashing loses placement points, it does not disqualify.
+- Submit = public repo URL + **optional** 40-char commit hash (empty = newest commit on the
+  default branch). We always paste the hash explicitly.
+- ≤ 20 MB at the submitted commit. The repo may be made **private** once scored; the
+  organizers keep a copy of every commit they score.
+- Practice = 48 matches vs 15 house bots (**4 easy, 4 medium, 4 hard, 3 expert**) acting as
+  one squad: shared vision, never fight each other, hunt the weakest mech first.
+- Builds: linux/amd64, network on, ≤ 10 min, uid 65534, no disk writes outside `/tmp` (64 MB).
+- Cutoff: **Sun 9:00 PM GMT+5**.
+
 ## Notes on the kit (things that differ from the brief)
 
 - Map files live in a `v2/` subfolder: `/arena/v2/world.json`, `/arena/v2/terrain.i16`.
