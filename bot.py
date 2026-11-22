@@ -43,7 +43,7 @@ def _norm(x, y):
 
 
 class Bot:
-    name = "mech-royale-v10"
+    name = "mech-royale-v11"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -73,6 +73,13 @@ class Bot:
         self.loot = None
         self.loot_until = -math.inf
         self.sprinting = False
+        self.strafe_sign = 1
+        self.strafe_until = -math.inf
+        self.recovery_until = -math.inf
+        self.enemy_motion = {}
+        self.last_attackers = {}
+        self.pickup_kind = None
+        self.capture = None
 
     @staticmethod
     def zone_limits(obs):
@@ -118,7 +125,19 @@ class Bot:
         eye = z + me["stats"]["eye_height"]
         now = obs["t"]
         vis = []
+        motion = {}
         for actor in obs["mechs"]:
+            actor_id = actor["id"]
+            velocity = actor["vel"]
+            previous = self.enemy_motion.get(actor_id)
+            acceleration = (0.0, 0.0)
+            if previous and 0.04 <= now - previous[0] <= 0.25:
+                dt = now - previous[0]
+                ax = (velocity[0] - previous[1]) / dt
+                ay = (velocity[1] - previous[2]) / dt
+                limit = max(1.0, math.hypot(ax, ay) / 25.0)
+                acceleration = (ax / limit, ay / limit)
+            motion[actor_id] = (now, velocity[0], velocity[1], *acceleration)
             if actor["kind"] != "mech":
                 continue
             px, py, pz = actor["pos"]
@@ -128,6 +147,7 @@ class Bot:
             if (self.world is None or
                     self.world.los_fast((x, y, eye), (px, py, target_z + 1.5))):
                 vis.append((distance, actor))
+        self.enemy_motion = motion
         vis.sort(key=lambda entry: (entry[0], entry[1]["id"]))
         for event in obs.get("events", ()):
             if event["type"] == "kill":
@@ -250,7 +270,6 @@ class Bot:
         me = obs["self"]
         x, y, z = me["pos"]
         zone = obs["zone"]
-        secondary = me["weapons"][1]
         now = obs["t"]
         best, best_cost = None, math.inf
         taken = {e.get("id") for e in obs.get("events", ()) if e["type"] == "took"}
@@ -281,11 +300,11 @@ class Bot:
 
         for item in obs.get("cubes", ()):
             if me["cubes"] < self.cfg["cubes"]["stat_cap"]:
-                consider(item, "cube", 2.8)
+                consider(item, "cube", 4.4 if me["cubes"] < 3 else 2.8)
         for item in obs.get("pickups", ()):
             kind = item["kind"]
-            if not secondary and kind in ("laser", "lightning"):
-                consider(item, "pickup", 3.7 if kind == "laser" else 2.8)
+            if self.want_weapon(me, kind):
+                consider(item, "pickup", 4.2 if kind == "lightning" else 3.3)
         for item in obs.get("drops", ()):
             if item["lands_in"] <= 5 and item.get("holder") in (None, me["id"]):
                 consider(item, "drop", 4.0)
@@ -304,8 +323,10 @@ class Bot:
                         consider(item, "npc", 1.5)
         if best:
             self.loot, self.loot_until = best, now + 2.5
+            if best[2] == "pickup":
+                self.pickup_kind = next(item["kind"] for item in obs["pickups"] if item["id"] == best[3])
         elif (self.loot and self.loot[2] in ("pickup", "cube", "drop")
-              and not (self.loot[2] == "pickup" and secondary)
+              and (self.loot[2] != "pickup" or self.want_weapon(me, self.pickup_kind))
               and self.loot[3] not in taken and now < self.loot_until
               and math.dist((x, y), self.loot[:2]) > 4.0
               and not contacts):
@@ -394,7 +415,7 @@ class Bot:
             return [0.0, 0.0], 0.0
         return [dx / d, dy / d], d
 
-    def evade_fire(self, obs, desired, boost, urgent):
+    def evade_fire(self, obs, desired, boost, urgent, short_target=None):
         """Score short movement trajectories against beam lines and projectile intercepts."""
         me = obs["self"]
         x, y, z = me["pos"]
@@ -416,7 +437,9 @@ class Bot:
             if (0.0 < along < 300.0 and abs(lateral) < radius + 8.0
                     and z - 4.0 < beam_z < z + stats["height"] + 4.0):
                 if not self.world or self.world.los_fast((px, py, height), (x, y, beam_z)):
-                    lasers.append((bx, by, lateral))
+                    # An already lined-up short can stop this charge immediately.
+                    if m["id"] != short_target:
+                        lasers.append((bx, by, lateral))
         shots = []
         for shot in obs.get("projectiles", ()):
             px, py, pz = shot["pos"]
@@ -438,7 +461,8 @@ class Bot:
             return desired, boost
 
         shots.sort()
-        boost = boost or (me["grounded"] and me["energy"] > (8 if lasers else 20))
+        reserve = 17 if short_target is not None else 0
+        boost = boost or (me["grounded"] and me["energy"] > (8 if lasers else 20) + reserve)
         speed = stats["boost_speed"] if boost and me["grounded"] else stats["walk_speed"]
         accel = stats["ground_accel"] if me["grounded"] else stats["air_accel"]
         zone = obs["zone"]
@@ -464,6 +488,10 @@ class Bot:
             score += (mx * self.evade[0] + my * self.evade[1]) * 1.3
             edge = math.hypot(px - cx, py - cy)
             score -= 1.2 * max(0.0, edge - max(old_edge, zone["radius"] - 1.0))
+            if self.capture:
+                point, radius_drop = self.capture
+                overrun = math.dist((px, py), point) - max(radius_drop - 1, math.dist((x, y), point))
+                score -= 4.0 * max(0.0, overrun)
             for bx, by, lateral in lasers:
                 miss = abs(lateral + bx * dy - by * dx)
                 score -= 19.0 * max(0.0, radius + 1.8 - miss) / (radius + 1.8)
@@ -501,16 +529,111 @@ class Bot:
         tx, ty, tz = target["pos"]
         tz += target.get("aim_height", AIM_HEIGHT * (1 + 0.05 * target.get("cubes", 0)))                 # torso centre, not the feet
         tv = target.get("vel") or [0.0, 0.0, 0.0]
+        motion = self.enemy_motion.get(target["id"])
+        ax, ay = motion[3:] if motion else (0.0, 0.0)
         mz = z + muzzle_height
         px, py, pz = tx, ty, tz
         tof = 0.0
         for _ in range(3):
             d = math.sqrt((px - x) ** 2 + (py - y) ** 2 + (pz - mz) ** 2)
             tof = max(0.0, d - 3.0) / speed   # shot starts 3 m out along the aim
-            px = tx + tv[0] * tof
-            py = ty + tv[1] * tof
-            pz = tz + tv[2] * tof
+            # Extrapolate direction changes briefly, then hold velocity.
+            bend = min(tof, 0.20)
+            px = tx + tv[0] * tof + ax * bend * (tof - 0.5 * bend) * 0.52
+            py = ty + tv[1] * tof + ay * bend * (tof - 0.5 * bend) * 0.52
+            pz = tz + tv[2] * min(tof, 0.30)
+        if self.world:
+            pz = max(pz, self.world.ground(px, py) + min(2.0, target.get("aim_height", 2.0)))
         return [px, py, pz]
+
+    @staticmethod
+    def want_weapon(me, kind):
+        held = me["weapons"][1]
+        if kind not in ("laser", "lightning"):
+            return False
+        if held is None:
+            return True
+        if held["kind"] == "mortar":
+            return True
+        return (kind == "lightning" and held["kind"] == "laser"
+                and not held.get("charge", 0.0))
+
+    def capture_goal(self, obs, enemy, urgent):
+        """Stay committed to a nearly complete heal without running into an enemy."""
+        me = obs["self"]
+        health = me["hp"] / me["max_hp"]
+        here = me["pos"][:2]
+        if urgent:
+            self.capture = None
+            return None
+        for drop in obs.get("drops", ()):
+            if drop["lands_in"] > 0 or drop.get("holder") not in (None, me["id"]):
+                continue
+            point = drop["pos"][:2]
+            distance = math.dist(here, point)
+            if distance > 23 or math.dist(point, obs["zone"]["center"]) > obs["zone"]["radius"] - 5:
+                continue
+            holding = drop.get("holder") == me["id"]
+            progress = drop.get("progress", 0.0)
+            worthwhile = health < 0.85 or me["cubes"] < 6
+            capture_s = drop.get("capture_s", self.cfg["drops"]["capture_s"])
+            almost_done = holding and progress >= 0.65 * capture_s
+            if worthwhile and (enemy > 88 or almost_done and enemy > 26):
+                self.capture = (point, drop.get("radius", self.cfg["drops"]["radius"]))
+                return point
+        self.capture = None
+        return None
+
+    def fight_goal(self, obs, target, distance, closing, retreat, arc_range):
+        """Choose a lateral firing lane that maintains the weapon's effective range."""
+        me = obs["self"]
+        x, y = me["pos"][:2]
+        tx, ty = target["pos"][:2]
+        ax, ay = _norm(x - tx, y - ty)
+        vx, vy = me["vel"][:2]
+        enemy_vx, enemy_vy = target["vel"][:2]
+        flee_speed = enemy_vx * -ax + enemy_vy * -ay
+        zone = obs["zone"]
+        target_range = arc_range * 0.72 if closing else 111.0
+        radial = max(-1.0, min(1.0, (target_range - distance) / (16.0 if closing else 58.0)))
+        if closing and distance > arc_range:
+            radial = min(radial, -0.82)
+        if retreat:
+            radial = max(radial, 0.65)
+        lateral = 0.35 if closing and distance > arc_range * 0.93 else 0.95
+        if closing and distance < arc_range and flee_speed > 5.0:
+            radial = min(radial, -0.52)
+        now = obs["t"]
+        if now >= self.strafe_until:
+            if abs(vx * -ay + vy * ax) > 3:
+                self.strafe_sign = 1 if vx * -ay + vy * ax >= 0 else -1
+            self.strafe_until = now + 0.65
+        best = None
+        best_score = -math.inf
+        for sign in (self.strafe_sign, -self.strafe_sign, 0):
+            dx, dy = _norm(radial * ax - sign * lateral * ay, radial * ay + sign * lateral * ax)
+            if not dx and not dy:
+                continue
+            point = (x + 12 * dx, y + 12 * dy)
+            if math.dist(point, zone["center"]) > zone["radius"] - 1.0:
+                continue
+            if self.world and not self.world.walkable_line((x, y), point):
+                continue
+            score = 3.0 * (dx * vx + dy * vy) / me["stats"]["walk_speed"]
+            if sign == self.strafe_sign:
+                score += 3.0
+            if closing:
+                score -= 0.33 * abs(math.dist(point, (tx, ty)) - target_range)
+            elif retreat:
+                score += 0.27 * (math.dist(point, (tx, ty)) - distance)
+            if score > best_score:
+                best, best_score = (point, sign), score
+        if best:
+            if best[1] and best[1] != self.strafe_sign:
+                self.strafe_sign = best[1]
+                self.strafe_until = now + 0.7
+            return best[0]
+        return None
 
     def combat(self, obs, target, distance, pressured):
         me = obs["self"]
@@ -532,15 +655,21 @@ class Bot:
         gun_aim = aim
         if kind == "lightning":
             stats = secondary["stats"]
+            cone = math.radians(stats["cone_deg"] * 0.5)
             yaw_error = abs((direct[0] - me["aim"][0] + math.pi) % math.tau - math.pi)
-            fire[1] = (math.hypot(distance, tp[2] + height - muzzle[2]) <= stats["range"] - 0.5
-                       and yaw_error < math.radians(stats["cone_deg"] * 0.42)
-                       and me["energy"] > stats["energy"] + 7.0)
+            if (math.hypot(distance, tp[2] + height - muzzle[2]) <= stats["range"] + 0.3 and
+                    me["energy"] >= stats["energy"] and secondary["cooldown"] < 0.105):
+                fire[1] = yaw_error <= cone * 0.94
+                lead_error = abs((direct[0] - aim[0] + math.pi) % math.tau - math.pi)
+                if lead_error > cone * 0.66:
+                    aim = [direct[0], aim[1]]
         elif kind == "laser" and target.get("kind") == "mech":
             stats = secondary["stats"]
             charge = secondary.get("charge", 0.0)
             error = self._aim_err(me["aim"], direct)
             aligned = error < max(0.012, math.atan2(2.8 * scale, max(10.0, distance)))
+            direct_ray = not self.world or self.world.los_fast(muzzle, (tp[0], tp[1], tp[2] + height))
+            aligned = aligned and direct_ray
             if charge > 0.0:
                 finish = stats["charge"] - 0.045
                 release = aligned and (charge >= finish or (pressured and charge >= 0.28))
@@ -548,16 +677,19 @@ class Bot:
                 aim = direct
                 fire[1] = hold
             elif (not pressured and secondary["cooldown"] <= 0
-                  and 38.0 < distance < stats["range"] - 3.0 and error < 0.08):
+                  and 27.0 < distance < stats["range"] - 3.0 and error < 0.08 and direct_ray):
                 aim = direct
                 fire[1] = True
 
         radius = target.get("aim_height", 2.5 * scale)
-        tolerance = max(0.012, min(0.18, math.atan2(radius * 1.15, max(7.0, distance))))
+        horizontal = max(0.011, min(0.20, math.atan2(radius * 1.13, max(7.0, distance))))
+        vertical = max(0.011, min(0.20, math.atan2(height * 0.81, max(7.0, distance))))
+        yaw_error = abs((me["aim"][0] - gun_aim[0] + math.pi) % math.tau - math.pi)
+        pitch_error = abs(me["aim"][1] - gun_aim[1])
         aligned = (gun and gun.get("ammo", 0) > 0 and gun.get("reload", 0.0) <= 0
                    and gun["cooldown"] < 0.11 and math.dist(muzzle, lead) <= gstats["range"] + 2.0
-                   and self._aim_err(me["aim"], gun_aim) <= tolerance
-                   and self._aim_err(aim, gun_aim) <= tolerance)
+                   and yaw_error <= horizontal and pitch_error <= vertical
+                   and self._aim_err(aim, gun_aim) <= horizontal)
         if aligned:
             current = (tp[0], tp[1], tp[2] + height)
             fire[0] = (self.world is None or self.world.los_fast(muzzle, lead)
@@ -594,14 +726,22 @@ class Bot:
             act["pick"] = self.pick_upgrade(obs["offer"])
 
         visible, contacts = self.threats(obs)
-        damage = next((event for event in obs.get("events", ())
-                       if event["type"] == "damaged" and event.get("bearing") is not None
-                       and event.get("weapon") != "npc"), None)
+        damage_events = [event for event in obs.get("events", ())
+                         if event["type"] == "damaged" and event.get("bearing") is not None
+                         and event.get("weapon") != "npc"]
+        damage = max(damage_events, key=lambda event: event.get("amount", 0), default=None)
+        self.last_attackers = {key: value for key, value in self.last_attackers.items()
+                               if now - value[0] <= 1.5}
+        for event in damage_events:
+            if event.get("by") is not None:
+                self.last_attackers[event["by"]] = (now, event.get("amount", 0))
         sound = next((event for event in obs.get("sounds", ()) if event["age"] < 0.35
                       and event["kind"] in ("gun", "laser", "laser_charge", "mortar", "lightning")
                       and event["dist"] == "near"), None)
         if any(e["type"] in ("damaged", "hit") for e in obs.get("events", ())):
             self.last_combat = now
+        if hp < 0.82 and damage:
+            self.recovery_until = now + me["stats"]["regen_delay"] + 3.0
         bearing = damage["bearing"] if damage else sound["bearing"] if sound else None
         if bearing is not None and not visible:
             distance = 42.0 if sound else 95.0
@@ -612,7 +752,8 @@ class Bot:
         nearby = sum(d < 215.0 for d, _ in visible)
         close = visible and visible[0][0] < 47.0
         secondary = me["weapons"][1]
-        lightning = secondary and secondary["kind"] == "lightning" and me["energy"] > 18
+        arc_range = secondary["stats"]["range"] if secondary and secondary["kind"] == "lightning" else 0.0
+        lightning = bool(arc_range and me["energy"] > 6)
         target = None
         distance = math.inf
         if visible:
@@ -620,12 +761,16 @@ class Bot:
             self.target_id = target["id"]
         else:
             self.target_id = None
-        weak_enemy = target and target.get("hp", 1400) < 390 and distance < 175
-        outmatched = nearby > 1 or hp < (0.43 if weak_enemy else 0.64)
-        retreat = bool(contacts and (outmatched or (close and not lightning and not weak_enemy)
+        weak_enemy = target and target.get("hp", 1400) < 425 and distance < 175
+        laser_enemy = target and "laser" in target.get("weapons", ())
+        closing = bool(nearby == 1 and lightning and (laser_enemy or distance < arc_range)
+                       and distance < arc_range + 43 and (hp > 0.62 or weak_enemy))
+        outmatched = nearby > 1 or hp < (0.43 if weak_enemy else 0.62)
+        retreat = bool(contacts and (outmatched or (close and not closing and not weak_enemy)
                                      or (damage and not visible) or (not visible and hp < 0.82)))
         recovering = (hp < 0.94 and not visible and
-                      (now - self.last_combat < me["stats"]["regen_delay"] + 10.0))
+                      (now < self.recovery_until or
+                       now - self.last_combat < me["stats"]["regen_delay"] + 8.0))
         goal = None
         loot = None
         zone = obs["zone"]
@@ -656,44 +801,44 @@ class Bot:
             elif me["cubes"] < 8:
                 goal = self.search_for_loot(obs)
 
-        # Take a nearby useful weapon even when cover or rotation is the movement goal.
-        if not secondary:
-            pickups = []
-            for pickup in obs.get("pickups", ()):
-                px, py, pz = pickup["pos"]
-                if pickup["kind"] in ("laser", "lightning") and abs(z - pz) <= 4:
-                    reach = math.dist((x, y), (px, py))
-                    if reach <= 22:
-                        pickups.append((reach, pickup["id"], px, py))
-            if pickups:
-                reach, pickup_id, px, py = min(pickups)
-                if reach <= self.cfg["loot"]["pickup_radius"]:
-                    act["take"] = pickup_id
-                elif (not urgent and not retreat and visible and visible[0][0] > 100 and
-                      self.world and self.world.walkable_line((x, y), (px, py))):
-                    goal = (px, py)
+        # Equip inside pickup range even while evading.
+        pickups = []
+        for pickup in obs.get("pickups", ()):
+            px, py, pz = pickup["pos"]
+            if self.want_weapon(me, pickup["kind"]) and abs(z - pz) <= 4:
+                reach = math.dist((x, y), (px, py))
+                if reach <= 24:
+                    rank = reach - (4 if pickup["kind"] == "lightning" else 0)
+                    pickups.append((rank, reach, pickup["id"], px, py))
+        if pickups:
+            reachable = [item for item in pickups if item[1] <= self.cfg["loot"]["pickup_radius"]]
+            _, reach, pickup_id, px, py = min(reachable or pickups)
+            if reachable:
+                act["take"] = pickup_id
+                if secondary:
+                    act["drop"] = 1
+            elif (not urgent and not retreat and visible and visible[0][0] > 82 and
+                  self.world and self.world.walkable_line((x, y), (px, py))):
+                goal = (px, py)
 
+        cap = self.capture_goal(obs, visible[0][0] if visible else math.inf, urgent)
+        if cap and (not retreat or math.dist((x, y), cap) < self.capture[1]):
+            goal = cap
+        else:
+            self.capture = None
+        if goal is None and visible and not retreat and not closing and visible[0][0] > 90:
+            cubes = [item["pos"] for item in obs.get("cubes", ())
+                     if abs(item["pos"][2] - z) < 4 and math.dist(item["pos"][:2], (x, y)) < 10]
+            if cubes and me["cubes"] < self.cfg["cubes"]["stat_cap"]:
+                point = min(cubes, key=lambda pos: math.dist(pos[:2], (x, y)))[:2]
+                if not self.world or self.world.walkable_line((x, y), point):
+                    goal = point
         if goal is None and visible:
-            _, threat = visible[0]
-            tx, ty = threat["pos"][:2]
-            ax, ay = _norm(x - tx, y - ty)
-            vx, vy = me["vel"][:2]
-            # Retain the current strafe while firing. Close only to secure an isolated kill.
-            preferred_range = 38.0 if lightning else 111.0
-            push = min(0.95, max(-0.7, (preferred_range - visible[0][0]) / 55.0))
-            if weak_enemy and not retreat:
-                push = min(push, -0.37)
-            if retreat:
-                push = max(push, 0.55)
-            sign = 1 if vx * -ay + vy * ax >= 0 else -1
-            directions = [(push * ax - side * ay, push * ay + side * ax) for side in (sign, -sign)]
-            directions.extend(((ax, ay), (-ay, ax), (ay, -ax)))
-            for dx, dy in directions:
-                candidate = x + 12 * dx, y + 12 * dy
-                if (math.dist(candidate, zone["center"]) <= zone["radius"] and
-                        (not self.world or self.world.walkable_line((x, y), candidate))):
-                    goal = candidate
-                    break
+            goal = self.fight_goal(obs, target, distance, closing and not retreat, retreat, arc_range)
+            if goal is None and weak_enemy and not retreat and not urgent:
+                point = target["pos"][:2]
+                if not self.world or self.world.is_walkable(*point):
+                    goal = point
 
         if goal is None:
             self.last_pos = None
@@ -702,13 +847,22 @@ class Bot:
         else:
             move, _ = self.navigate(obs, goal)
         long_move = goal is not None and math.dist((x, y), goal) > 10.0
-        if long_move and (retreat or urgent) and me["grounded"]:
-            reserve = 13.0 if retreat else 6.0
+        rush = closing and distance > arc_range + 7.0 and not retreat and not urgent
+        if long_move and (retreat or urgent or rush) and me["grounded"]:
+            reserve = 25.0 if rush else 13.0 if retreat else 6.0
             self.sprinting = me["energy"] > (reserve if self.sprinting else reserve + 34.0)
         else:
             self.sprinting = False
         boost = self.sprinting or not me["in_zone"]
-        move, boost = self.evade_fire(obs, move, boost, urgent)
+        short_target = None
+        if (target and closing and laser_enemy and distance < arc_range - 2
+                and me["energy"] >= secondary["stats"]["energy"] + 4
+                and abs(target["pos"][2] - z) < 8 and secondary["cooldown"] < 0.06):
+            yaw = math.atan2(target["pos"][1] - y, target["pos"][0] - x)
+            error = abs((yaw - me["aim"][0] + math.pi) % math.tau - math.pi)
+            if error < math.radians(secondary["stats"]["cone_deg"] * 0.40):
+                short_target = target["id"]
+        move, boost = self.evade_fire(obs, move, boost, urgent, short_target)
         jump = False
         if self.jump_hold:
             self.jump_hold -= 1
@@ -736,8 +890,15 @@ class Bot:
         hp = target.get("hp", 1400)
         cost = min(distance, 235.0) * 0.60 + max(0, distance - 225.0) * 2.5
         cost += turn * 33.0 + min(1400.0, hp) * 0.066
+        secondary = me["weapons"][1]
+        if (secondary and secondary["kind"] == "lightning"
+                and distance < secondary["stats"]["range"] and "laser" in target.get("weapons", ())):
+            cost -= 28.0
         if target.get("charging") and distance < 280.0:
             cost -= 15.0
+        attack = self.last_attackers.get(target["id"])
+        if attack:
+            cost -= min(18.0, 0.08 * attack[1])
         if target["id"] == self.target_id:
             cost -= 13.0
         return cost

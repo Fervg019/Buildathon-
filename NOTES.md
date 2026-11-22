@@ -152,3 +152,36 @@ for v10. Docker was unavailable in the editing environment.
 
 Run `python check/check.py -- python -u bot.py`, then the Docker smoke test
 in README.md. Submit the exact tested commit for the 48-match practice run.
+
+## v11 candidate — convert isolated fights into eliminations
+
+The reported v10 score was **3.15**. v11 targets a failure observed in a
+controlled chase test: the older strafe could keep the bot out of its own
+lightning range while an isolated enemy was moving away.
+
+- Give lightning priority over an idle laser when a swap is available.
+  Approach isolated laser-armed enemies when healthy, and stabilize
+  inside lightning range. Avoid trading with groups or pursuing during
+  urgent rotation. Use short sprint bursts to get within range while
+  preserving enough energy to fire. Prevent a needless dodge when a
+  well-aligned lightning shot can interrupt the opposing charge.
+- Keep a consistent strafe side, account for recent target acceleration
+  in gun lead, and favor attackers that recently landed high damage.
+  Check the laser ray before charging, and validate horizontal and
+  vertical gun alignment independently.
+- Prioritize the first three cubes, collect nearby safe cubes while
+  fighting at range, and stay in a nearly complete supply capture when
+  the heal is worth the exposure. Dashes and dodges still respect urgency.
+
+The newly attached official kit has the same protocol and recorded checker
+stream as the existing kit. v11 passed all 300 observations on one logical
+CPU with zero invalid or late answers (p99 6.2 ms, max 6.6 ms in the final
+checker run). Separate stress testing peaked at 8.75 ms across 160 ticks
+with 15 charging contacts and 24 projectiles. Two runs of the conformance
+stream produced identical actions. In a simplified flat 12-second test
+against a retreating 6 m/s target, v10 never got a lightning shot and v11
+first fired at 2.5 s. These are local checks. v11's official placement
+score and the 7.00 target require a builders-4 practice run.
+
+Run `python check/check.py -- python -u bot.py` and submit the tested commit
+to the official 96-match scorer. A Docker runtime was unavailable here.
