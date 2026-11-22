@@ -153,18 +153,22 @@ for v10. Docker was unavailable in the editing environment.
 Run `python check/check.py -- python -u bot.py`, then the Docker smoke test
 in README.md. Submit the exact tested commit for the 48-match practice run.
 
-## v14 — opening equipment acquisition
+## v15 — arm-gun tracking on the v10 baseline
 
-Reported official practice: v10 3.15, v11 2.94, v12 2.81, v13 2.91.
-v14 branches from v10. In quiet openings without a secondary, sweep the
-torso independently of walking, remember observed weapons briefly, and
-sprint toward a chosen pickup with an energy reserve. Threats take aim
-priority. v10 combat and retreat logic remain in place.
+Reported builders-4 practice scores: v10 3.15, v11 2.94, v12 2.81,
+v13 2.91, v14 3.09. Each submission uses fresh seeds.
 
-In 96 paired synthetic openings on the supplied map, with a single ground
-laser 55–85 m away, randomized starting yaw, clear initial sight line and
-walking route, approximate movement/vision and no enemies, v10 acquired
-the laser within 20 s in 93 cases, v14 in 96. Median acquisition times
-including timeouts capped at 20 s were 6.7 and 4.3 s. This measures only
-opening acquisition. Official placement needs the private scorer.
-The kit checker passed 300/300 with no late responses on one logical CPU.
+Only arm-gun aiming and trigger alignment changed from v10. Lead includes
+relative horizontal movement during the observation-to-shot interval.
+Horizontal and vertical alignment use separate cylinder dimensions. If a
+shot is still cooling down, account for bounded turret movement before it
+can discharge. v10's search, retreat and movement policies are retained.
+
+Paired synthetic tests over 96 open-field circular target trajectories with
+Gaussian spread and a stationary shooter: both versions fired 2304 shots
+in each 10-second test set. Counting discharge before turret slew, hits
+went from 2126 to 2238. Counting it after slew, hits went from 2224 to
+2236. These simplified tests omit enemies firing back, walls and placement.
+The bundled conformance checker passed 300/300 on one logical CPU (p99
+6.7 ms, maximum 7.4 ms); two replay runs emitted identical actions.
+Official placement still requires a private scorer run.

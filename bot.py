@@ -43,7 +43,7 @@ def _norm(x, y):
 
 
 class Bot:
-    name = "mech-royale-v14"
+    name = "mech-royale-v15"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -73,7 +73,6 @@ class Bot:
         self.loot = None
         self.loot_until = -math.inf
         self.sprinting = False
-        self.seen_weapons = {}
 
     @staticmethod
     def zone_limits(obs):
@@ -244,21 +243,6 @@ class Bot:
                 best_i, best_rank = i, rank
         return best_i
 
-    def remember_weapons(self, obs):
-        me = obs["self"]
-        if me["weapons"][1]:
-            self.seen_weapons.clear()
-            return
-        now = obs["t"]
-        here = me["pos"]
-        visible = {p["id"]: p for p in obs.get("pickups", ())
-                   if p["kind"] in ("laser", "lightning")}
-        self.seen_weapons = {
-            key: (item, seen) for key, (item, seen) in self.seen_weapons.items()
-            if now - seen < 15 and (key in visible or math.dist(here, item["pos"]) > 12)
-        }
-        self.seen_weapons.update({key: (item, now) for key, item in visible.items()})
-
     def economy_target(self, obs, contacts):
         """Rank visible rewards and carry a walking goal through brief vision loss."""
         if self.world is None:
@@ -298,10 +282,10 @@ class Bot:
         for item in obs.get("cubes", ()):
             if me["cubes"] < self.cfg["cubes"]["stat_cap"]:
                 consider(item, "cube", 2.8)
-        for item, _ in self.seen_weapons.values():
+        for item in obs.get("pickups", ()):
             kind = item["kind"]
             if not secondary and kind in ("laser", "lightning"):
-                consider(item, "pickup", 6.2 if kind == "laser" else 4.7)
+                consider(item, "pickup", 3.7 if kind == "laser" else 2.8)
         for item in obs.get("drops", ()):
             if item["lands_in"] <= 5 and item.get("holder") in (None, me["id"]):
                 consider(item, "drop", 4.0)
@@ -539,6 +523,15 @@ class Bot:
         scale = 1.0 + 0.05 * target.get("cubes", 0)
         height = target.get("aim_height", AIM_HEIGHT * scale)
         lead = self._gun_lead(me["pos"], target, gstats["speed"], muzzle_height)
+        # A command remains active across two physics updates. Compensate
+        # for relative movement between observation and discharge.
+        tick_time = 1.0 / self.cfg["match"]["tick_hz"]
+        delay = tick_time * 0.8
+        if gun:
+            delay = max(delay, min(2 * tick_time, gun["cooldown"]))
+        target_velocity = target.get("vel", (0.0, 0.0, 0.0))
+        lead[0] += (target_velocity[0] - me["vel"][0]) * delay
+        lead[1] += (target_velocity[1] - me["vel"][1]) * delay
         direct = [math.atan2(tp[1] - y, tp[0] - x),
                   math.atan2(tp[2] + height - muzzle[2], distance)]
         aim = [math.atan2(lead[1] - y, lead[0] - x),
@@ -569,11 +562,21 @@ class Bot:
                 fire[1] = True
 
         radius = target.get("aim_height", 2.5 * scale)
-        tolerance = max(0.012, min(0.18, math.atan2(radius * 1.15, max(7.0, distance))))
+        # The trigger spans two physics updates. Check yaw and pitch separately:
+        # the target cylinder is taller than it is wide. Allow conservative
+        # turret travel before the gun can next discharge.
+        stats = me["stats"]
+        cooldown = gun["cooldown"] if gun else 0.0
+        slew = min(tick_time, max(0, cooldown))
+        horizontal = math.atan2(radius, max(7.0, distance))
+        vertical = math.atan2(height * 0.88, max(7.0, distance))
+        yaw_offset = abs((me["aim"][0] - gun_aim[0] + math.pi) % math.tau - math.pi)
+        pitch_offset = abs(me["aim"][1] - gun_aim[1])
         aligned = (gun and gun.get("ammo", 0) > 0 and gun.get("reload", 0.0) <= 0
-                   and gun["cooldown"] < 0.11 and math.dist(muzzle, lead) <= gstats["range"] + 2.0
-                   and self._aim_err(me["aim"], gun_aim) <= tolerance
-                   and self._aim_err(aim, gun_aim) <= tolerance)
+                   and cooldown < 0.11 and math.dist(muzzle, lead) <= gstats["range"] + 2.0
+                   and yaw_offset <= horizontal + stats["turn_rate"] * slew
+                   and pitch_offset <= vertical + stats["pitch_rate"] * slew
+                   and self._aim_err(aim, gun_aim) <= horizontal)
         if aligned:
             current = (tp[0], tp[1], tp[2] + height)
             fire[0] = (self.world is None or self.world.los_fast(muzzle, lead)
@@ -609,7 +612,6 @@ class Bot:
         if obs.get("offer"):
             act["pick"] = self.pick_upgrade(obs["offer"])
 
-        self.remember_weapons(obs)
         visible, contacts = self.threats(obs)
         damage = next((event for event in obs.get("events", ())
                        if event["type"] == "damaged" and event.get("bearing") is not None
@@ -719,10 +721,8 @@ class Bot:
         else:
             move, _ = self.navigate(obs, goal)
         long_move = goal is not None and math.dist((x, y), goal) > 10.0
-        fetching = (loot is not None and loot[2] == "pickup" and not contacts and long_move
-                    and goal is not None and math.dist(goal, (x, y)) > 17)
-        if long_move and (retreat or urgent or fetching) and me["grounded"]:
-            reserve = 44.0 if fetching else 13.0 if retreat else 6.0
+        if long_move and (retreat or urgent) and me["grounded"]:
+            reserve = 13.0 if retreat else 6.0
             self.sprinting = me["energy"] > (reserve if self.sprinting else reserve + 34.0)
         else:
             self.sprinting = False
@@ -741,11 +741,6 @@ class Bot:
             act["aim"] = [bearing, 0.0]
         elif contacts:
             act["aim"] = [math.atan2(contacts[0][1] - y, contacts[0][0] - x), 0.0]
-        elif loot and loot[2] == "pickup":
-            act["aim"] = [math.atan2(loot[1] - y, loot[0] - x), 0.0]
-        elif not secondary and not urgent and not recovering and loot is None:
-            # Sweep while walking. Movement is independently expressed in world coordinates.
-            act["aim"] = [(me["aim"][0] + 0.55 + math.pi) % math.tau - math.pi, 0.0]
         elif any(move):
             act["aim"] = [math.atan2(move[1], move[0]), 0.0]
         else:
