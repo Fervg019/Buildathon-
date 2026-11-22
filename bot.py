@@ -43,7 +43,7 @@ def _norm(x, y):
 
 
 class Bot:
-    name = "mech-royale-v12"
+    name = "mech-royale-v13"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -73,12 +73,8 @@ class Bot:
         self.loot = None
         self.loot_until = -math.inf
         self.sprinting = False
-        self.roof_plan = None
-        self.roof_stage = None
-        self.roof_started = -math.inf
-        self.roof_retry = -math.inf
-        self.last_damage = -math.inf
-        self.drop_hold = None
+        self.laser_fired_at = {}
+        self.beam_danger = False
 
     @staticmethod
     def zone_limits(obs):
@@ -208,138 +204,6 @@ class Bot:
                 best, best_cost = point, cost
         return best
 
-    def choose_roof(self, obs, contacts, ground_cover):
-        """Look for a sheltered roof with an approach that can be flown safely."""
-        me = obs["self"]
-        x, y, z = me["pos"]
-        here = (x, y)
-        zone = obs["zone"]
-        next_center = zone["next_center"]
-        next_radius = zone["next_radius"]
-        if next_radius < 25 or len(contacts) == 0:
-            return None
-        ranked = []
-        for entry, pad, top in self.world.roof_access:
-            walk = math.dist(here, entry)
-            if walk > 42 or math.dist(pad, zone["center"]) > zone["radius"] - 12:
-                continue
-            if math.dist(pad, next_center) > next_radius - min(10.0, next_radius * 0.20):
-                continue
-            if math.dist(pad, next_center) < 12 and next_radius < 55:
-                continue
-            height = top - self.world.ground(*entry)
-            jet_seconds = (height + 3) / me["stats"]["max_rise_speed"] + 0.7
-            required_energy = jet_seconds * me["stats"]["jet_drain"] + 16
-            if me["energy"] < required_energy:
-                continue
-            if any(math.dist(entry, (tx, ty)) < 44 for tx, ty, _, _, _, _ in contacts):
-                continue
-            ranked.append((walk + 0.72 * height, entry, pad, top))
-        cover_threats = contacts[:3]
-        if ground_cover and math.dist(here, ground_cover) < 38:
-            gx, gy = ground_cover
-            gpos = (gx, gy, self.world.ground(gx, gy) + me["stats"]["muzzle_height"])
-            if all(not self.world.los_fast(gpos, (tx, ty, tz))
-                   and math.dist(ground_cover, (tx, ty)) > 55
-                   for tx, ty, tz, _, _, _ in cover_threats):
-                return None
-        best = None
-        best_cost = math.inf
-        for base, entry, pad, top in sorted(ranked)[:10]:
-            if not self.world.walkable_line(here, entry):
-                continue
-            px, py = pad
-            ex, ey = entry
-            height = me["stats"]["muzzle_height"]
-            if not self.world.los((ex, ey, self.world.ground(ex, ey) + 2), (ex, ey, top + height + 3)):
-                continue
-            primary = cover_threats[0]
-            if self.world.los_fast((px, py, top + height), primary[:3]):
-                continue
-            exposure = 0.0
-            for tx, ty, tz, confidence, _, _ in cover_threats:
-                if self.world.los_fast((px, py, top + height), (tx, ty, tz)):
-                    exposure += 45.0 * confidence
-                if self.world.los_fast((ex, ey, top - 2), (tx, ty, tz)):
-                    exposure += 14.0 * confidence
-            cost = base + exposure
-            if cost < best_cost:
-                best, best_cost = (entry, pad, top), cost
-        return best
-
-    def rooftop_move(self, obs, urgent, retreat, contacts, ground_cover):
-        """Return a move, jump and boost override while using a roof."""
-        me, now = obs["self"], obs["t"]
-        here = tuple(me["pos"][:2])
-        z = me["pos"][2]
-        if not self.world:
-            return None
-        if (self.roof_plan is None and retreat and not urgent and now >= self.roof_retry
-                and me["grounded"] and me["energy"] > 62 and me["hp"] > 290):
-            self.roof_retry = now + 2.0
-            candidate = self.choose_roof(obs, contacts, ground_cover)
-            if candidate:
-                self.roof_plan = candidate
-                self.roof_stage = "approach"
-                self.roof_started = now
-        if self.roof_plan is None:
-            return None
-
-        entry, pad, top = self.roof_plan
-        stage = self.roof_stage
-        if urgent:
-            if stage in ("cross", "hold") or z > self.world.ground(*here) + 7:
-                stage = self.roof_stage = "exit"
-            else:
-                self.roof_plan = None
-                self.roof_retry = now + 7.0
-                return None
-        if stage not in ("hold", "exit") and now - self.roof_started > 9.5:
-            stage = self.roof_stage = "exit"
-        if stage == "approach":
-            if math.dist(here, entry) > 1.6:
-                move, _ = self.navigate(obs, entry, arrival=1.4)
-                return move, False, False
-            self.roof_stage = stage = "climb"
-        if stage == "climb":
-            if z < top + 3.8:
-                dx, dy = entry[0] - here[0], entry[1] - here[1]
-                scale = max(5.0, math.hypot(dx, dy))
-                if me["energy"] > 13:
-                    return [dx / scale, dy / scale], me["grounded"], True
-                stage = self.roof_stage = "exit"
-            else:
-                stage = self.roof_stage = "cross"
-        if stage == "cross":
-            if math.dist(here, pad) < 2.25 and me["grounded"] and abs(z - top) < 2.4:
-                stage = self.roof_stage = "hold"
-                self.roof_started = now
-            else:
-                local_top = self.world.roof_top(*here)
-                flying = local_top < top - 1.2 and z < top + 5.5 and me["energy"] > 9
-                dx, dy = pad[0] - here[0], pad[1] - here[1]
-                scale = max(5.0, math.hypot(dx, dy))
-                return [dx / scale, dy / scale], False, flying
-        if stage == "hold":
-            healthy = me["hp"] >= me["max_hp"] * 0.95
-            stuck_in_fight = now - self.roof_started > 14 and now - self.last_damage < 3
-            if (healthy and not contacts and now - self.roof_started > 3) or stuck_in_fight:
-                self.roof_stage = stage = "exit"
-            else:
-                d = math.dist(here, pad)
-                move = list(_norm(pad[0] - here[0], pad[1] - here[1])) if d > 2.0 else [0.0, 0.0]
-                return move, False, False
-        if stage == "exit":
-            if me["grounded"] and z <= self.world.ground(*here) + 2:
-                self.roof_plan = None
-                self.roof_retry = now + 10.0
-                self.path = None
-                return None
-            d = math.dist(here, entry)
-            move = list(_norm(entry[0] - here[0], entry[1] - here[1])) if d > 2 else [0.0, 0.0]
-            return move, False, False
-        return None
-
     def search_for_loot(self, obs):
         """Sweep nearby ground when vision has yielded no safe loot."""
         here = tuple(obs["self"]["pos"][:2])
@@ -419,22 +283,20 @@ class Bot:
 
         for item in obs.get("cubes", ()):
             if me["cubes"] < self.cfg["cubes"]["stat_cap"]:
-                consider(item, "cube", 4.2 if me["cubes"] < 3 else 2.8)
+                consider(item, "cube", 2.8)
         for item in obs.get("pickups", ()):
             kind = item["kind"]
             if not secondary and kind in ("laser", "lightning"):
                 consider(item, "pickup", 3.7 if kind == "laser" else 2.8)
         for item in obs.get("drops", ()):
-            trip = math.dist((x, y), item["pos"][:2]) / me["stats"]["walk_speed"]
-            if item["lands_in"] <= min(13.0, trip + 3.0) and item.get("holder") in (None, me["id"]):
-                value = 8.0 if me["cubes"] < 6 or me["hp"] < 0.82 * me["max_hp"] else 4.0
-                consider(item, "drop", value)
+            if item["lands_in"] <= 5 and item.get("holder") in (None, me["id"]):
+                consider(item, "drop", 4.0)
         if not contacts and me["cubes"] < 10 and me["hp"] > 0.64 * me["max_hp"]:
             muzzle = (x, y, z + me["stats"]["muzzle_height"])
             for item in obs.get("crates", ()):
                 px, py, pz = item["pos"]
                 if math.dist((x, y), (px, py)) < 105 and self.world.los_fast(muzzle, (px, py, pz + 1)):
-                    consider(item, "crate", 1.1 if me["cubes"] < 3 else 0.84)
+                    consider(item, "crate", 0.84)
             farming_drone = self.loot and self.loot[2] == "npc"
             if me["weapons"][0] and (farming_drone or me["weapons"][0].get("ammo", 0) >= 8):
                 for item in obs["mechs"]:
@@ -455,12 +317,12 @@ class Bot:
         return best
 
     # ------------------------------------------------------------- movement
-    def navigate(self, obs, goal, arrival=2.5):
+    def navigate(self, obs, goal):
         """Move direction toward `goal` using a cached A* path (replanned lazily)."""
         me = obs["self"]
         x, y = me["pos"][0], me["pos"][1]
         t = obs["t"]
-        at_goal = _hypot2(goal[0] - x, goal[1] - y) < arrival
+        at_goal = _hypot2(goal[0] - x, goal[1] - y) < 2.5
 
         if self.last_pos is None:
             self.last_pos = (x, y)
@@ -542,6 +404,7 @@ class Bot:
         stats = me["stats"]
         radius = stats["radius"]
         lasers = []
+        self.beam_danger = False
         for m in obs["mechs"]:
             if m["kind"] != "mech" or not m.get("charging"):
                 continue
@@ -557,7 +420,9 @@ class Bot:
                     and z - 4.0 < beam_z < z + stats["height"] + 4.0):
                 if not self.world or self.world.los_fast((px, py, height), (x, y, beam_z)):
                     lasers.append((bx, by, lateral))
+        self.beam_danger = bool(lasers)
         shots = []
+        gun_margin = radius + 0.5
         for shot in obs.get("projectiles", ()):
             px, py, pz = shot["pos"]
             dx, dy, dz = shot["vel"]
@@ -570,9 +435,16 @@ class Bot:
             if not 0.0 < eta < 0.65:
                 continue
             mortar = shot["kind"] == "mortar"
-            width = radius + (5.0 if mortar else 0.5)
-            if math.hypot(rx - eta * sx, ry - eta * sy) < width + 7.0:
-                shots.append((eta, px, py, pz, dx, dy, dz, width, mortar))
+            width = radius + 5.0 if mortar else gun_margin
+            gravity = self.cfg["weapons"]["mortar"]["gravity"] if mortar else 0.0
+            shot_z = pz + dz * eta - 0.5 * gravity * eta * eta
+            feet = z + vz * eta
+            if not feet - width <= shot_z <= feet + stats["height"] + width:
+                continue
+            # Reserve boost for trajectories that could actually intersect.
+            if math.hypot(rx - eta * sx, ry - eta * sy) >= width + 2.1:
+                continue
+            shots.append((eta, px, py, dx, dy, width))
         if not lasers and not shots:
             self.evade = (0.0, 0.0)
             return desired, boost
@@ -580,6 +452,9 @@ class Bot:
         shots.sort()
         boost = boost or (me["grounded"] and me["energy"] > (8 if lasers else 20))
         speed = stats["boost_speed"] if boost and me["grounded"] else stats["walk_speed"]
+        secondary = me["weapons"][1]
+        if secondary and secondary["kind"] == "laser" and secondary.get("charge", 0) > 0:
+            speed *= stats["charge_move_mult"]
         accel = stats["ground_accel"] if me["grounded"] else stats["air_accel"]
         zone = obs["zone"]
         cx, cy = zone["center"]
@@ -604,18 +479,11 @@ class Bot:
             score += (mx * self.evade[0] + my * self.evade[1]) * 1.3
             edge = math.hypot(px - cx, py - cy)
             score -= 1.2 * max(0.0, edge - max(old_edge, zone["radius"] - 1.0))
-            if self.drop_hold:
-                point, radius_drop = self.drop_hold
-                score -= 6.0 * max(0.0, math.dist((px, py), point) - radius_drop + 0.5)
             for bx, by, lateral in lasers:
                 miss = abs(lateral + bx * dy - by * dx)
                 score -= 19.0 * max(0.0, radius + 1.8 - miss) / (radius + 1.8)
                 score += min(7.0, abs(bx * dy - by * dx)) * 1.05
-            for eta, sx, sy, sz, svx, svy, svz, width, mortar in near_shots:
-                shot_z = sz + svz * eta - (11.0 * eta * eta if mortar else 0.0)
-                feet = z + vz * eta
-                if not feet - width <= shot_z <= feet + stats["height"] + width:
-                    continue
+            for eta, sx, sy, svx, svy, width in near_shots:
                 ramp = min(change, eta)
                 scale = eta - 0.5 * ramp if change <= eta else eta * eta / (2 * change)
                 miss = math.hypot(x + vx * eta + dvx * scale - sx - svx * eta,
@@ -655,7 +523,7 @@ class Bot:
             pz = tz + tv[2] * tof
         return [px, py, pz]
 
-    def combat(self, obs, target, distance, pressured):
+    def combat(self, obs, target, distance, movement_urgent):
         me = obs["self"]
         x, y, z = me["pos"]
         gun, secondary = me["weapons"]
@@ -683,15 +551,28 @@ class Bot:
             stats = secondary["stats"]
             charge = secondary.get("charge", 0.0)
             error = self._aim_err(me["aim"], direct)
-            aligned = error < max(0.012, math.atan2(2.8 * scale, max(10.0, distance)))
+            target_center = (tp[0], tp[1], tp[2] + height)
+            within_range = 25.0 < math.dist(muzzle, target_center) < stats["range"] - 1.5
+            open_ray = within_range and (not self.world or self.world.los_fast(muzzle, target_center))
+            aligned = open_ray and error < max(0.012, math.atan2(2.8 * scale, max(10.0, distance)))
+            elapsed = obs["t"] - self.laser_fired_at.get(target["id"], -math.inf)
+            enemy_reloading = 0 <= elapsed < 0.88
+            incoming_laser = self.beam_danger or target.get("charging", False)
             if charge > 0.0:
-                finish = stats["charge"] - 0.045
-                release = aligned and (charge >= finish or (pressured and charge >= 0.28))
-                hold = not release and (not pressured or charge < finish)
+                cube_stats = self.cfg["cubes"]
+                multiplier = 1 + cube_stats["damage_per_cube"] * min(me["cubes"], cube_stats["stat_cap"])
+                fraction = stats["min_frac"] + (1 - stats["min_frac"]) * min(1, charge / stats["charge"])
+                lethal = fraction * stats["damage"] * multiplier * 0.82 >= target.get("hp", math.inf)
+                full = charge >= stats["charge"] - 0.045
+                break_mobility = movement_urgent or incoming_laser and not enemy_reloading
+                charged_enough = charge >= stats["min_charge"] - 0.015
+                release = aligned and charged_enough and (lethal or full or break_mobility)
+                force_release = not open_ray or (break_mobility and charge >= 0.35)
                 aim = direct
-                fire[1] = hold
-            elif (not pressured and secondary["cooldown"] <= 0
-                  and 38.0 < distance < stats["range"] - 3.0 and error < 0.08):
+                fire[1] = not (release or force_release)
+            elif (not movement_urgent and not incoming_laser and open_ray
+                    and secondary["cooldown"] <= 0.05 and error < 0.11
+                    and (self.evade == (0.0, 0.0) or enemy_reloading)):
                 aim = direct
                 fire[1] = True
 
@@ -735,6 +616,12 @@ class Bot:
         act = {"tick": obs["tick"]}
         if obs.get("offer"):
             act["pick"] = self.pick_upgrade(obs["offer"])
+        for beam in obs.get("beams", ()):
+            if beam["kind"] == "laser" and beam.get("by") is not None:
+                self.laser_fired_at[beam["by"]] = now - beam.get("age", 0.0)
+        for event in obs.get("events", ()):
+            if event["type"] == "damaged" and event.get("weapon") == "laser" and event.get("by") is not None:
+                self.laser_fired_at[event["by"]] = now
 
         visible, contacts = self.threats(obs)
         damage = next((event for event in obs.get("events", ())
@@ -745,8 +632,6 @@ class Bot:
                       and event["dist"] == "near"), None)
         if any(e["type"] in ("damaged", "hit") for e in obs.get("events", ())):
             self.last_combat = now
-        if any(e["type"] == "damaged" for e in obs.get("events", ())):
-            self.last_damage = now
         bearing = damage["bearing"] if damage else sound["bearing"] if sound else None
         if bearing is not None and not visible:
             distance = 42.0 if sound else 95.0
@@ -818,21 +703,6 @@ class Bot:
                       self.world and self.world.walkable_line((x, y), (px, py))):
                     goal = (px, py)
 
-        self.drop_hold = None
-        if not urgent and not self.roof_plan:
-            for drop in obs.get("drops", ()):
-                if drop.get("holder") != me["id"]:
-                    continue
-                point = drop["pos"][:2]
-                radius = drop.get("radius", self.cfg["drops"]["radius"])
-                if math.dist((x, y), point) > radius:
-                    continue
-                remaining = drop.get("capture_s", self.cfg["drops"]["capture_s"]) - drop.get("progress", 0)
-                if remaining < 1.25 and ((hp > 0.30 and nearby < 2) or not visible):
-                    goal = point
-                    self.drop_hold = (point, radius)
-                    break
-
         if goal is None and visible:
             _, threat = visible[0]
             tx, ty = threat["pos"][:2]
@@ -874,16 +744,11 @@ class Bot:
             self.jump_hold -= 1
             jump = bool(me["grounded"] and self.jump_hold == 11 and goal is not None)
             boost = boost or (goal is not None and not me["grounded"] and me["energy"] > 14)
-        rooftop = self.rooftop_move(obs, urgent, retreat, contacts, self.cover) if not self.drop_hold else None
-        if rooftop is not None:
-            move, jump, boost = rooftop
         act.update(move=move, boost=boost, jump=jump)
 
         if target:
-            clean_finish = (nearby == 1 and weak_enemy and distance > 70
-                            and not target.get("charging") and hp > 0.50)
-            under_pressure = urgent or rooftop is not None or self.evade != (0.0, 0.0)
-            act.update(self.combat(obs, target, distance, under_pressure or (retreat and not clean_finish)))
+            must_move = urgent or (retreat and (nearby > 1 or hp < 0.47 or distance < 50))
+            act.update(self.combat(obs, target, distance, must_move))
         elif bearing is not None:
             act["aim"] = [bearing, 0.0]
         elif contacts:
@@ -892,10 +757,6 @@ class Bot:
             act["aim"] = [math.atan2(move[1], move[0]), 0.0]
         else:
             act["aim"] = list(me["aim"])
-        if (self.roof_plan is not None and self.roof_stage == "hold" and hp < 0.91
-                and now - self.last_damage > 1.1 and (not visible or visible[0][0] > 95)):
-            act["fire"] = [False, False]
-            target = None
         self.reload_when_safe(obs, act, target)
         return act
 

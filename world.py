@@ -98,7 +98,6 @@ class World:
         self.rows = max(1, int(math.ceil((self.max_y - self.min_y) / cell)))
         self._hash_prisms()
         self._build_grid()
-        self.roof_access = self._find_roof_access()
 
     # ------------------------------------------------------------- terrain
     def ground(self, x: float, y: float) -> float:
@@ -219,53 +218,6 @@ class World:
                             self.wall_base[i] = base
                         if top > self.wall_top[i]:
                             self.wall_top[i] = top
-
-    def roof_top(self, x, y):
-        c, r = self.cell_of(x, y)
-        return self.wall_top[r * self.cols + c]
-
-    def _find_roof_access(self):
-        """Pair clear vertical approaches with broad, level rooftop cells."""
-        entries = []
-        cols, rows, cell = self.cols, self.rows, self.cell
-        tops = self.wall_top
-        for r in range(4, rows - 4, 2):
-            y = self.oy + (r + 0.5) * cell
-            for c in range(4, cols - 4, 2):
-                x = self.ox + (c + 0.5) * cell
-                i = r * cols + c
-                if not self.walk[i]:
-                    continue
-                if any(tops[i + offset] > tops[i] + 1.0
-                       for offset in (-1, 1, -cols, cols, -cols-1, -cols+1, cols-1, cols+1)):
-                    continue
-                ground = self.ground(x, y)
-                if tops[i] > ground + 0.7:
-                    continue
-                for dc, dr in ((1, 0), (-1, 0), (0, 1), (0, -1)):
-                    delta = dc + dr * cols
-                    first = next((k for k in range(2, 5)
-                                  if 13.0 <= tops[i + k * delta] - ground <= 39.0), None)
-                    if first is None:
-                        continue
-                    top = tops[i + first * delta]
-                    across = dr + dc * cols
-                    landing = min(first + 3, 7)
-                    if not (2 <= c + landing * dc < cols - 2 and 2 <= r + landing * dr < rows - 2):
-                        continue
-                    first_cell = i + first * delta
-                    pad_cell = i + landing * delta
-                    if tops[first_cell - delta] > top + 0.6:
-                        continue
-                    if any(abs(tops[cell_id] - top) > 0.8 for cell_id in (
-                            pad_cell, pad_cell - across, pad_cell + across,
-                            pad_cell - delta, pad_cell + delta, pad_cell - 2 * delta)):
-                        continue
-                    if any(tops[i + k * delta + side * across] > top + 0.8
-                           for k in range(1, landing + 1) for side in (-1, 0, 1)):
-                        continue
-                    entries.append(((x, y), (x + landing * cell * dc, y + landing * cell * dr), top))
-        return entries
 
     def los_fast(self, a, b) -> bool:
         """Cheap line of sight using the wall-height grid (terrain + buildings).

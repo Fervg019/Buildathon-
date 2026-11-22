@@ -153,29 +153,25 @@ for v10. Docker was unavailable in the editing environment.
 Run `python check/check.py -- python -u bot.py`, then the Docker smoke test
 in README.md. Submit the exact tested commit for the 48-match practice run.
 
-## v12 candidate — rooftop disengagement and supply recovery
+## v13 candidate — projectile filtering and laser timing
 
-Reported builders-4 practice scores: v10 **3.15**, v11 **2.94**. v12 branches
-from v10 and retains its normal weapon choice and engagement ranges.
+Reported official scores: v10 **3.15**, v11 **2.94**, v12 **2.81**.
+v13 uses v10 as its base.
 
-- When hurt or outnumbered, use a sheltered rooftop as an alternate escape
-  route if ground cover is weak. The map lookup requires a clear vertical
-  approach, a broad landing surface, adequate jet energy, and obstruction of
-  the main pursuer's sight line. The controller approaches, climbs, crosses,
-  lands, and returns to ground on rotation. It allows a wounded mech to heal
-  before resuming sustained fire from the roof.
-- Start toward valuable supply drops before they land and stay within the
-  capture radius when the heal is nearly complete. Give the first three
-  cubes more weight. Extend an isolated fight only for a clean laser finish.
+- v10 was reproduced boosting and suppressing its own laser charge for a
+  bullet crossing 50 m overhead. Filter projectile warnings by vertical
+  clearance and actual horizontal intercept margin before evasive control.
+  Use the current charge's movement penalty when predicting a dodge.
+- Track recent enemy laser releases from observations. Favor the brief
+  enemy cooldown window for a countercharge, release a partial beam when
+  it is sufficient to finish a target, and release promptly when movement
+  becomes urgent.
 
-Local checks on one CPU: the official recorded checker passed all 300
-observations with zero invalid or late answers, p99 6.4 ms and max 6.5 ms.
-Two runs produced identical actions. A 160-tick synthetic high-load case
-peaked at 10.13 ms. All ten sampled rooftop ascents reached their landing
-pads in a simplified grid-based controller simulation. That simulation
-omits some engine collision behavior and opponent actions. Docker and the
-official 96-match scorer were unavailable in the editing environment, so
-the placement score and 7.00 target remain unverified.
-
-Run `python check/check.py -- python -u bot.py` and the Docker smoke test
-from README.md before submitting the commit.
+The focused scenarios passed, including overhead vs. intersecting bullets,
+enemy cooldown, partial finishing beams and full-charge release. Two fresh
+runs produced identical replay actions. The official local checker passed
+all 300 observations with zero invalid or late answers. On one logical CPU,
+p99 was 6.9 ms and max was 7.9 ms. No official v13 placement result is
+available. If the scorer exposes a replay, collect the first death or two
+and inspect incoming weapon, charge timeline, and cause of death before
+changing strategy again.
