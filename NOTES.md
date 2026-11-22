@@ -153,35 +153,29 @@ for v10. Docker was unavailable in the editing environment.
 Run `python check/check.py -- python -u bot.py`, then the Docker smoke test
 in README.md. Submit the exact tested commit for the 48-match practice run.
 
-## v11 candidate — convert isolated fights into eliminations
+## v12 candidate — rooftop disengagement and supply recovery
 
-The reported v10 score was **3.15**. v11 targets a failure observed in a
-controlled chase test: the older strafe could keep the bot out of its own
-lightning range while an isolated enemy was moving away.
+Reported builders-4 practice scores: v10 **3.15**, v11 **2.94**. v12 branches
+from v10 and retains its normal weapon choice and engagement ranges.
 
-- Give lightning priority over an idle laser when a swap is available.
-  Approach isolated laser-armed enemies when healthy, and stabilize
-  inside lightning range. Avoid trading with groups or pursuing during
-  urgent rotation. Use short sprint bursts to get within range while
-  preserving enough energy to fire. Prevent a needless dodge when a
-  well-aligned lightning shot can interrupt the opposing charge.
-- Keep a consistent strafe side, account for recent target acceleration
-  in gun lead, and favor attackers that recently landed high damage.
-  Check the laser ray before charging, and validate horizontal and
-  vertical gun alignment independently.
-- Prioritize the first three cubes, collect nearby safe cubes while
-  fighting at range, and stay in a nearly complete supply capture when
-  the heal is worth the exposure. Dashes and dodges still respect urgency.
+- When hurt or outnumbered, use a sheltered rooftop as an alternate escape
+  route if ground cover is weak. The map lookup requires a clear vertical
+  approach, a broad landing surface, adequate jet energy, and obstruction of
+  the main pursuer's sight line. The controller approaches, climbs, crosses,
+  lands, and returns to ground on rotation. It allows a wounded mech to heal
+  before resuming sustained fire from the roof.
+- Start toward valuable supply drops before they land and stay within the
+  capture radius when the heal is nearly complete. Give the first three
+  cubes more weight. Extend an isolated fight only for a clean laser finish.
 
-The newly attached official kit has the same protocol and recorded checker
-stream as the existing kit. v11 passed all 300 observations on one logical
-CPU with zero invalid or late answers (p99 6.2 ms, max 6.6 ms in the final
-checker run). Separate stress testing peaked at 8.75 ms across 160 ticks
-with 15 charging contacts and 24 projectiles. Two runs of the conformance
-stream produced identical actions. In a simplified flat 12-second test
-against a retreating 6 m/s target, v10 never got a lightning shot and v11
-first fired at 2.5 s. These are local checks. v11's official placement
-score and the 7.00 target require a builders-4 practice run.
+Local checks on one CPU: the official recorded checker passed all 300
+observations with zero invalid or late answers, p99 6.4 ms and max 6.5 ms.
+Two runs produced identical actions. A 160-tick synthetic high-load case
+peaked at 10.13 ms. All ten sampled rooftop ascents reached their landing
+pads in a simplified grid-based controller simulation. That simulation
+omits some engine collision behavior and opponent actions. Docker and the
+official 96-match scorer were unavailable in the editing environment, so
+the placement score and 7.00 target remain unverified.
 
-Run `python check/check.py -- python -u bot.py` and submit the tested commit
-to the official 96-match scorer. A Docker runtime was unavailable here.
+Run `python check/check.py -- python -u bot.py` and the Docker smoke test
+from README.md before submitting the commit.
