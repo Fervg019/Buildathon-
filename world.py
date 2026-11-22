@@ -180,6 +180,16 @@ class World:
                     continue
                 walk[row + c] = 1
         self.walk = walk
+        # Prefer room for the mech cylinder when choosing a route around a corner.
+        # Keep narrow cells available for cases where they are the only exit.
+        cols, rows = self.cols, self.rows
+        self.narrow = bytearray(cols * rows)
+        for r in range(1, rows - 1):
+            for c in range(1, cols - 1):
+                i = r * cols + c
+                if walk[i]:
+                    self.narrow[i] = sum(not walk[j] for j in
+                                         (i - 1, i + 1, i - cols, i + cols))
         self._build_wall_heights()
 
     def _build_wall_heights(self) -> None:
@@ -354,6 +364,7 @@ class World:
         cols, rows, walk = self.cols, self.rows, self.walk
         c0, r0 = self.cell_of(sx, sy)
         c1, r1 = self.cell_of(gx, gy)
+        starts_on_ground = bool(walk[r0 * cols + c0])
         c0, r0 = self.nearest_walkable(c0, r0)
         c1, r1 = self.nearest_walkable(c1, r1)
         start = r0 * cols + c0
@@ -401,7 +412,7 @@ class World:
                 if dc and dr:  # no corner cutting
                     if not walk[cr * cols + nc2] or not walk[nr2 * cols + cc]:
                         continue
-                ng = gc + cost
+                ng = gc + cost + 0.42 * self.narrow[ni]
                 if ng < g.get(ni, 1e18):
                     g[ni] = ng
                     came[ni] = cur
@@ -420,4 +431,7 @@ class World:
                 self.oy + (p // cols + 0.5) * self.cell] for p in path]
         if found and self.is_walkable(gx, gy):
             pts[-1] = [gx, gy]
+        if not starts_on_ground:
+            pts.insert(0, [self.ox + (c0 + 0.5) * self.cell,
+                           self.oy + (r0 + 0.5) * self.cell])
         return pts

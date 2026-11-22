@@ -121,3 +121,34 @@ candidate can be overlaid on the existing submission checkout.
 - The first placement test requires the official 48-match practice evaluation.
   Record its commit SHA and score here. Placement cannot be inferred from the
   recorded-stream checker or the synthetic stress case.
+
+## v10 candidate — early power and moving cover
+
+v9's official practice score was **1.41** (user-reported). The run's individual
+match records were unavailable. v6 remains the best measured baseline at
+**2.04**. The **7.00** objective requires a new official practice result.
+
+- Use quiet periods to search for cubes, weapons, safe crates, and isolated
+  drones. Loot outside the next circle is eligible when the current circle
+  and rotation deadline permit it. Briefly remember pickup positions when
+  they leave view. Equip a nearby laser or lightning even during a fight.
+- Choose cover based on both the destination and approach, including where
+  moving pursuers could reopen a firing angle. Use sustained sprint bursts
+  while escaping and leave a window to regenerate energy. Preserve health
+  regeneration when hurt and out of contact.
+- Keep pressure on an isolated weakened opponent. At safe range, charge
+  the laser and use the gun in parallel when both aim solutions agree.
+  Ignore beam telegraphs with a solid obstruction in the way.
+- Prefer wider A* routes around walls. Allow more time for urgent zone
+  rotation and aim several metres past the next circle's safety buffer.
+
+Local checks on one logical CPU: 300/300 conformance observations passed,
+zero late or invalid responses. The final observed p99 was 8.4 ms and the
+maximum was 11.8 ms. Two independent runs generated the same actions.
+A separate 160-tick synthetic stress case with 15 charging contacts and
+24 projectiles peaked at 23.02 ms. Fixed observations and synthetic loads
+measure policy behavior and latency. Official placement remains unmeasured
+for v10. Docker was unavailable in the editing environment.
+
+Run `python check/check.py -- python -u bot.py`, then the Docker smoke test
+in README.md. Submit the exact tested commit for the 48-match practice run.
