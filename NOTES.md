@@ -153,25 +153,18 @@ for v10. Docker was unavailable in the editing environment.
 Run `python check/check.py -- python -u bot.py`, then the Docker smoke test
 in README.md. Submit the exact tested commit for the 48-match practice run.
 
-## v13 candidate — projectile filtering and laser timing
+## v14 — opening equipment acquisition
 
-Reported official scores: v10 **3.15**, v11 **2.94**, v12 **2.81**.
-v13 uses v10 as its base.
+Reported official practice: v10 3.15, v11 2.94, v12 2.81, v13 2.91.
+v14 branches from v10. In quiet openings without a secondary, sweep the
+torso independently of walking, remember observed weapons briefly, and
+sprint toward a chosen pickup with an energy reserve. Threats take aim
+priority. v10 combat and retreat logic remain in place.
 
-- v10 was reproduced boosting and suppressing its own laser charge for a
-  bullet crossing 50 m overhead. Filter projectile warnings by vertical
-  clearance and actual horizontal intercept margin before evasive control.
-  Use the current charge's movement penalty when predicting a dodge.
-- Track recent enemy laser releases from observations. Favor the brief
-  enemy cooldown window for a countercharge, release a partial beam when
-  it is sufficient to finish a target, and release promptly when movement
-  becomes urgent.
-
-The focused scenarios passed, including overhead vs. intersecting bullets,
-enemy cooldown, partial finishing beams and full-charge release. Two fresh
-runs produced identical replay actions. The official local checker passed
-all 300 observations with zero invalid or late answers. On one logical CPU,
-p99 was 6.9 ms and max was 7.9 ms. No official v13 placement result is
-available. If the scorer exposes a replay, collect the first death or two
-and inspect incoming weapon, charge timeline, and cause of death before
-changing strategy again.
+In 96 paired synthetic openings on the supplied map, with a single ground
+laser 55–85 m away, randomized starting yaw, clear initial sight line and
+walking route, approximate movement/vision and no enemies, v10 acquired
+the laser within 20 s in 93 cases, v14 in 96. Median acquisition times
+including timeouts capped at 20 s were 6.7 and 4.3 s. This measures only
+opening acquisition. Official placement needs the private scorer.
+The kit checker passed 300/300 with no late responses on one logical CPU.

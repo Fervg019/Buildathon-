@@ -43,7 +43,7 @@ def _norm(x, y):
 
 
 class Bot:
-    name = "mech-royale-v13"
+    name = "mech-royale-v14"
 
     def __init__(self, hello):
         self.cfg = hello["config"]
@@ -73,8 +73,7 @@ class Bot:
         self.loot = None
         self.loot_until = -math.inf
         self.sprinting = False
-        self.laser_fired_at = {}
-        self.beam_danger = False
+        self.seen_weapons = {}
 
     @staticmethod
     def zone_limits(obs):
@@ -245,6 +244,21 @@ class Bot:
                 best_i, best_rank = i, rank
         return best_i
 
+    def remember_weapons(self, obs):
+        me = obs["self"]
+        if me["weapons"][1]:
+            self.seen_weapons.clear()
+            return
+        now = obs["t"]
+        here = me["pos"]
+        visible = {p["id"]: p for p in obs.get("pickups", ())
+                   if p["kind"] in ("laser", "lightning")}
+        self.seen_weapons = {
+            key: (item, seen) for key, (item, seen) in self.seen_weapons.items()
+            if now - seen < 15 and (key in visible or math.dist(here, item["pos"]) > 12)
+        }
+        self.seen_weapons.update({key: (item, now) for key, item in visible.items()})
+
     def economy_target(self, obs, contacts):
         """Rank visible rewards and carry a walking goal through brief vision loss."""
         if self.world is None:
@@ -284,10 +298,10 @@ class Bot:
         for item in obs.get("cubes", ()):
             if me["cubes"] < self.cfg["cubes"]["stat_cap"]:
                 consider(item, "cube", 2.8)
-        for item in obs.get("pickups", ()):
+        for item, _ in self.seen_weapons.values():
             kind = item["kind"]
             if not secondary and kind in ("laser", "lightning"):
-                consider(item, "pickup", 3.7 if kind == "laser" else 2.8)
+                consider(item, "pickup", 6.2 if kind == "laser" else 4.7)
         for item in obs.get("drops", ()):
             if item["lands_in"] <= 5 and item.get("holder") in (None, me["id"]):
                 consider(item, "drop", 4.0)
@@ -404,7 +418,6 @@ class Bot:
         stats = me["stats"]
         radius = stats["radius"]
         lasers = []
-        self.beam_danger = False
         for m in obs["mechs"]:
             if m["kind"] != "mech" or not m.get("charging"):
                 continue
@@ -420,9 +433,7 @@ class Bot:
                     and z - 4.0 < beam_z < z + stats["height"] + 4.0):
                 if not self.world or self.world.los_fast((px, py, height), (x, y, beam_z)):
                     lasers.append((bx, by, lateral))
-        self.beam_danger = bool(lasers)
         shots = []
-        gun_margin = radius + 0.5
         for shot in obs.get("projectiles", ()):
             px, py, pz = shot["pos"]
             dx, dy, dz = shot["vel"]
@@ -435,16 +446,9 @@ class Bot:
             if not 0.0 < eta < 0.65:
                 continue
             mortar = shot["kind"] == "mortar"
-            width = radius + 5.0 if mortar else gun_margin
-            gravity = self.cfg["weapons"]["mortar"]["gravity"] if mortar else 0.0
-            shot_z = pz + dz * eta - 0.5 * gravity * eta * eta
-            feet = z + vz * eta
-            if not feet - width <= shot_z <= feet + stats["height"] + width:
-                continue
-            # Reserve boost for trajectories that could actually intersect.
-            if math.hypot(rx - eta * sx, ry - eta * sy) >= width + 2.1:
-                continue
-            shots.append((eta, px, py, dx, dy, width))
+            width = radius + (5.0 if mortar else 0.5)
+            if math.hypot(rx - eta * sx, ry - eta * sy) < width + 7.0:
+                shots.append((eta, px, py, pz, dx, dy, dz, width, mortar))
         if not lasers and not shots:
             self.evade = (0.0, 0.0)
             return desired, boost
@@ -452,9 +456,6 @@ class Bot:
         shots.sort()
         boost = boost or (me["grounded"] and me["energy"] > (8 if lasers else 20))
         speed = stats["boost_speed"] if boost and me["grounded"] else stats["walk_speed"]
-        secondary = me["weapons"][1]
-        if secondary and secondary["kind"] == "laser" and secondary.get("charge", 0) > 0:
-            speed *= stats["charge_move_mult"]
         accel = stats["ground_accel"] if me["grounded"] else stats["air_accel"]
         zone = obs["zone"]
         cx, cy = zone["center"]
@@ -483,7 +484,11 @@ class Bot:
                 miss = abs(lateral + bx * dy - by * dx)
                 score -= 19.0 * max(0.0, radius + 1.8 - miss) / (radius + 1.8)
                 score += min(7.0, abs(bx * dy - by * dx)) * 1.05
-            for eta, sx, sy, svx, svy, width in near_shots:
+            for eta, sx, sy, sz, svx, svy, svz, width, mortar in near_shots:
+                shot_z = sz + svz * eta - (11.0 * eta * eta if mortar else 0.0)
+                feet = z + vz * eta
+                if not feet - width <= shot_z <= feet + stats["height"] + width:
+                    continue
                 ramp = min(change, eta)
                 scale = eta - 0.5 * ramp if change <= eta else eta * eta / (2 * change)
                 miss = math.hypot(x + vx * eta + dvx * scale - sx - svx * eta,
@@ -523,7 +528,7 @@ class Bot:
             pz = tz + tv[2] * tof
         return [px, py, pz]
 
-    def combat(self, obs, target, distance, movement_urgent):
+    def combat(self, obs, target, distance, pressured):
         me = obs["self"]
         x, y, z = me["pos"]
         gun, secondary = me["weapons"]
@@ -551,28 +556,15 @@ class Bot:
             stats = secondary["stats"]
             charge = secondary.get("charge", 0.0)
             error = self._aim_err(me["aim"], direct)
-            target_center = (tp[0], tp[1], tp[2] + height)
-            within_range = 25.0 < math.dist(muzzle, target_center) < stats["range"] - 1.5
-            open_ray = within_range and (not self.world or self.world.los_fast(muzzle, target_center))
-            aligned = open_ray and error < max(0.012, math.atan2(2.8 * scale, max(10.0, distance)))
-            elapsed = obs["t"] - self.laser_fired_at.get(target["id"], -math.inf)
-            enemy_reloading = 0 <= elapsed < 0.88
-            incoming_laser = self.beam_danger or target.get("charging", False)
+            aligned = error < max(0.012, math.atan2(2.8 * scale, max(10.0, distance)))
             if charge > 0.0:
-                cube_stats = self.cfg["cubes"]
-                multiplier = 1 + cube_stats["damage_per_cube"] * min(me["cubes"], cube_stats["stat_cap"])
-                fraction = stats["min_frac"] + (1 - stats["min_frac"]) * min(1, charge / stats["charge"])
-                lethal = fraction * stats["damage"] * multiplier * 0.82 >= target.get("hp", math.inf)
-                full = charge >= stats["charge"] - 0.045
-                break_mobility = movement_urgent or incoming_laser and not enemy_reloading
-                charged_enough = charge >= stats["min_charge"] - 0.015
-                release = aligned and charged_enough and (lethal or full or break_mobility)
-                force_release = not open_ray or (break_mobility and charge >= 0.35)
+                finish = stats["charge"] - 0.045
+                release = aligned and (charge >= finish or (pressured and charge >= 0.28))
+                hold = not release and (not pressured or charge < finish)
                 aim = direct
-                fire[1] = not (release or force_release)
-            elif (not movement_urgent and not incoming_laser and open_ray
-                    and secondary["cooldown"] <= 0.05 and error < 0.11
-                    and (self.evade == (0.0, 0.0) or enemy_reloading)):
+                fire[1] = hold
+            elif (not pressured and secondary["cooldown"] <= 0
+                  and 38.0 < distance < stats["range"] - 3.0 and error < 0.08):
                 aim = direct
                 fire[1] = True
 
@@ -616,13 +608,8 @@ class Bot:
         act = {"tick": obs["tick"]}
         if obs.get("offer"):
             act["pick"] = self.pick_upgrade(obs["offer"])
-        for beam in obs.get("beams", ()):
-            if beam["kind"] == "laser" and beam.get("by") is not None:
-                self.laser_fired_at[beam["by"]] = now - beam.get("age", 0.0)
-        for event in obs.get("events", ()):
-            if event["type"] == "damaged" and event.get("weapon") == "laser" and event.get("by") is not None:
-                self.laser_fired_at[event["by"]] = now
 
+        self.remember_weapons(obs)
         visible, contacts = self.threats(obs)
         damage = next((event for event in obs.get("events", ())
                        if event["type"] == "damaged" and event.get("bearing") is not None
@@ -732,8 +719,10 @@ class Bot:
         else:
             move, _ = self.navigate(obs, goal)
         long_move = goal is not None and math.dist((x, y), goal) > 10.0
-        if long_move and (retreat or urgent) and me["grounded"]:
-            reserve = 13.0 if retreat else 6.0
+        fetching = (loot is not None and loot[2] == "pickup" and not contacts and long_move
+                    and goal is not None and math.dist(goal, (x, y)) > 17)
+        if long_move and (retreat or urgent or fetching) and me["grounded"]:
+            reserve = 44.0 if fetching else 13.0 if retreat else 6.0
             self.sprinting = me["energy"] > (reserve if self.sprinting else reserve + 34.0)
         else:
             self.sprinting = False
@@ -747,12 +736,16 @@ class Bot:
         act.update(move=move, boost=boost, jump=jump)
 
         if target:
-            must_move = urgent or (retreat and (nearby > 1 or hp < 0.47 or distance < 50))
-            act.update(self.combat(obs, target, distance, must_move))
+            act.update(self.combat(obs, target, distance, retreat or urgent or self.evade != (0.0, 0.0)))
         elif bearing is not None:
             act["aim"] = [bearing, 0.0]
         elif contacts:
             act["aim"] = [math.atan2(contacts[0][1] - y, contacts[0][0] - x), 0.0]
+        elif loot and loot[2] == "pickup":
+            act["aim"] = [math.atan2(loot[1] - y, loot[0] - x), 0.0]
+        elif not secondary and not urgent and not recovering and loot is None:
+            # Sweep while walking. Movement is independently expressed in world coordinates.
+            act["aim"] = [(me["aim"][0] + 0.55 + math.pi) % math.tau - math.pi, 0.0]
         elif any(move):
             act["aim"] = [math.atan2(move[1], move[0]), 0.0]
         else:
